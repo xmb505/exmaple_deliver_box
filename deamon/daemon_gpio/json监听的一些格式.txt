@@ -1,0 +1,74 @@
+现在client主动连接server，server广播给所有连接的client
+
+# 监听GPIO状态变化的JSON格式说明
+
+## 单个GPIO设备监听
+- 支持单个GPIO设备的状态监听
+- 高电平采集模式：仅输出从高电平变为低电平的GPIO引脚
+- 低电平采集模式：仅输出从低电平变为高电平的GPIO引脚
+
+{
+    "gpios": [
+        {
+            "alias": "geter",
+            "default_bit": 1,
+            "change_gpio": [
+                {
+                    "gpio": 1,
+                    "bit": 0
+                },
+                {
+                    "gpio": 2,
+                    "bit": 0
+                }
+            ]
+        }
+    ]
+}
+
+## 多个GPIO设备监听
+- 支持同时监听多个GPIO设备的状态变化
+- 每个设备可以独立设置默认电平模式
+
+{
+    "gpios": [
+        {
+            "alias": "geter",
+            "default_bit": 1,
+            "change_gpio": [
+                {
+                    "gpio": 1,
+                    "bit": 0
+                },
+                {
+                    "gpio": 2,
+                    "bit": 0
+                }
+            ]
+        },
+        {
+            "alias": "sensor1",
+            "default_bit": 0,
+            "change_gpio": [
+                {
+                    "gpio": 1,
+                    "bit": 1
+                }
+            ]
+        },
+        {
+            "alias": "sensor2",
+            "default_bit": 1,
+            "change_gpio": [
+                {
+                    "gpio": 3,
+                    "bit": 0
+                }
+            ]
+        }
+    ]
+}
+
+## 触发机制说明
+- 高电平采集模式 (default_bit: 1)：仅当某个GPIO从1变为0时才会输出（适用于按钮按下拉到地线的情况）
+- 低电平采集模式 (default_bit: 0)：仅当某个GPIO从0变为1时才会输出（适用于传感器上拉到VCC的情况）

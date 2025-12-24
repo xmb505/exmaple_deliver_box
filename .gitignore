@@ -1,0 +1,33 @@
+# 临时文件
+*.tmp
+*.temp
+*.log
+*.pid
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# IDE相关
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Socket文件
+/tmp/gpio.sock
+/tmp/gpio_get.sock
+
+# 配置文件备份
+*.bak
+*.backup
