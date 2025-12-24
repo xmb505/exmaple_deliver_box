@@ -1,0 +1,18 @@
+这个程序负责将控制HT1621的二进制翻译成UNIX Socket，我不想再写底层了
+这个程序会放一个ht1621.sock给外部程序访问
+然后连接gpio.sock，使用spi模式操作HT1621
+
+JSON控制语句
+
+{
+    "device_id": 1,
+    "display_data": "123456"
+}
+
+当然：
+{
+    "device_id": 2,
+    "display_data": "Err404",
+}
+
+这里的device_id对应配置文件里面的device_spi_io = [0-5]

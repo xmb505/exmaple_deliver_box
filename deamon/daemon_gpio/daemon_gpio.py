@@ -182,6 +182,10 @@ class USBGPIOController:
         for i, bit in enumerate(data):
             bit_start_time = time.time()
             
+            # 跳过空格字符
+            if bit == ' ':
+                continue
+                
             # 设置数据位（仅在状态变化时设置）
             bit = int(bit)
             if last_data_state is None or last_data_state != bit:
