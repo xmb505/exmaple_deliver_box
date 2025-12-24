@@ -28,6 +28,9 @@ class USBGPIOController:
         self.simulate = simulate
         self.gpio_states = {}  # 用于模拟模式下的GPIO状态
         
+        # 添加一个状态跟踪字典，记录当前各GPIO引脚的状态
+        self.current_gpio_states = {}
+        
         if not simulate:
             self.connect()
         else:
@@ -64,6 +67,7 @@ class USBGPIOController:
                         pin = command[i]
                         state = command[i + 1]
                         self.gpio_states[pin] = state
+                        self.current_gpio_states[pin] = state  # 同时更新当前状态
                         i += 2
                     else:
                         break
@@ -92,9 +96,26 @@ class USBGPIOController:
             return False
     
     def set_gpio(self, gpio_states):
-        """设置GPIO状态，gpio_states为字典 {pin: state, ...}"""
+        """
+        设置GPIO状态，gpio_states为字典 {pin: state, ...}
+        优化：只对状态发生变化的GPIO引脚发送命令
+        """
+        # 筛选出状态真正发生变化的GPIO
+        changed_states = {}
+        for pin, new_state in gpio_states.items():
+            # 检查是否是第一次设置或者状态是否发生了变化
+            current_state = self.current_gpio_states.get(pin)
+            if current_state is None or current_state != new_state:
+                changed_states[pin] = new_state
+                self.current_gpio_states[pin] = new_state  # 更新当前状态
+        
+        if not changed_states:
+            # 如果没有状态变化，直接返回
+            return True
+        
+        # 发送实际发生变化的GPIO状态
         command = bytearray([0x3A])
-        for gpio_pin, state in gpio_states.items():
+        for gpio_pin, state in changed_states.items():
             command.append(gpio_pin)
             command.append(state)
         return self.send_command(bytes(command))
@@ -118,7 +139,7 @@ class USBGPIOController:
         return None
     
     def set_spi(self, clk_pin, data_pin, cs_pin, data, cs_collection="down", lag_time=0.001, debug_spi=False):
-        """使用bit-banging方式实现SPI通信，支持任意比特数"""
+        """使用bit-banging方式实现SPI通信，支持任意比特数，优化GPIO设置"""
         import time
         
         start_time = time.time()
@@ -154,59 +175,98 @@ class USBGPIOController:
         if debug_spi:
             print(f"[SPI调试] CS设置耗时: {set_end - set_start:.6f}s")
         
-        # 发送数据（每一位）
+        # 发送数据（每一位），优化：避免不必要的电平切换
+        last_data_state = None
+        last_clk_state = None
+        
         for i, bit in enumerate(data):
             bit_start_time = time.time()
             
-            # 设置数据位
-            if debug_spi:
-                print(f"[SPI调试] 设置DATA({data_pin}) = {bit} (第{i+1}位)")
-            set_start = time.time()
-            self.set_gpio({data_pin: int(bit)})
-            time.sleep(lag_time)
-            set_end = time.time()
-            if debug_spi:
-                print(f"[SPI调试] DATA设置耗时: {set_end - set_start:.6f}s")
+            # 设置数据位（仅在状态变化时设置）
+            bit = int(bit)
+            if last_data_state is None or last_data_state != bit:
+                if debug_spi:
+                    print(f"[SPI调试] 设置DATA({data_pin}) = {bit} (第{i+1}位)")
+                set_start = time.time()
+                self.set_gpio({data_pin: bit})
+                time.sleep(lag_time)
+                set_end = time.time()
+                if debug_spi:
+                    print(f"[SPI调试] DATA设置耗时: {set_end - set_start:.6f}s")
+                last_data_state = bit
+            else:
+                # 数据位状态未变化，但仍需要保持延迟
+                time.sleep(lag_time)
+                if debug_spi:
+                    print(f"[SPI调试] DATA({data_pin}) = {bit} 保持不变 (第{i+1}位)")
             
-            # 时钟脉冲
+            # 时钟脉冲 - 优化时钟线状态切换
             if cs_collection == "down":
                 # 对于下降沿触发，先拉高时钟，再拉低
-                if debug_spi:
-                    print(f"[SPI调试] 设置CLK({clk_pin}) = 1")
-                set_start = time.time()
-                self.set_gpio({clk_pin: 1})
-                time.sleep(lag_time)
-                set_end = time.time()
-                if debug_spi:
-                    print(f"[SPI调试] CLK拉高耗时: {set_end - set_start:.6f}s")
+                # 设置CLK为高电平（仅在状态变化时设置）
+                if last_clk_state is None or last_clk_state != 1:
+                    if debug_spi:
+                        print(f"[SPI调试] 设置CLK({clk_pin}) = 1")
+                    set_start = time.time()
+                    self.set_gpio({clk_pin: 1})
+                    last_clk_state = 1
+                    set_end = time.time()
+                    if debug_spi:
+                        print(f"[SPI调试] CLK拉高耗时: {set_end - set_start:.6f}s")
+                else:
+                    time.sleep(lag_time)  # 保持延迟
+                    if debug_spi:
+                        print(f"[SPI调试] CLK({clk_pin}) = 1 保持不变")
                 
-                if debug_spi:
-                    print(f"[SPI调试] 设置CLK({clk_pin}) = 0 (下降沿采样)")
-                set_start = time.time()
-                self.set_gpio({clk_pin: 0})
                 time.sleep(lag_time)
-                set_end = time.time()
-                if debug_spi:
-                    print(f"[SPI调试] CLK拉低耗时: {set_end - set_start:.6f}s")
+                
+                # 设置CLK为低电平（仅在状态变化时设置） - 下降沿采样
+                if last_clk_state != 0:
+                    if debug_spi:
+                        print(f"[SPI调试] 设置CLK({clk_pin}) = 0 (下降沿采样)")
+                    set_start = time.time()
+                    self.set_gpio({clk_pin: 0})
+                    last_clk_state = 0
+                    set_end = time.time()
+                    if debug_spi:
+                        print(f"[SPI调试] CLK拉低耗时: {set_end - set_start:.6f}s")
+                else:
+                    time.sleep(lag_time)  # 保持延迟
+                    if debug_spi:
+                        print(f"[SPI调试] CLK({clk_pin}) = 0 保持不变")
             else:
                 # 对于上升沿触发，先拉低时钟，再拉高
-                if debug_spi:
-                    print(f"[SPI调试] 设置CLK({clk_pin}) = 0")
-                set_start = time.time()
-                self.set_gpio({clk_pin: 0})
-                time.sleep(lag_time)
-                set_end = time.time()
-                if debug_spi:
-                    print(f"[SPI调试] CLK拉低耗时: {set_end - set_start:.6f}s")
+                # 设置CLK为低电平（仅在状态变化时设置）
+                if last_clk_state is None or last_clk_state != 0:
+                    if debug_spi:
+                        print(f"[SPI调试] 设置CLK({clk_pin}) = 0")
+                    set_start = time.time()
+                    self.set_gpio({clk_pin: 0})
+                    last_clk_state = 0
+                    set_end = time.time()
+                    if debug_spi:
+                        print(f"[SPI调试] CLK拉低耗时: {set_end - set_start:.6f}s")
+                else:
+                    time.sleep(lag_time)  # 保持延迟
+                    if debug_spi:
+                        print(f"[SPI调试] CLK({clk_pin}) = 0 保持不变")
                 
-                if debug_spi:
-                    print(f"[SPI调试] 设置CLK({clk_pin}) = 1 (上升沿采样)")
-                set_start = time.time()
-                self.set_gpio({clk_pin: 1})
                 time.sleep(lag_time)
-                set_end = time.time()
-                if debug_spi:
-                    print(f"[SPI调试] CLK拉高耗时: {set_end - set_start:.6f}s")
+                
+                # 设置CLK为高电平（仅在状态变化时设置） - 上升沿采样
+                if last_clk_state != 1:
+                    if debug_spi:
+                        print(f"[SPI调试] 设置CLK({clk_pin}) = 1 (上升沿采样)")
+                    set_start = time.time()
+                    self.set_gpio({clk_pin: 1})
+                    last_clk_state = 1
+                    set_end = time.time()
+                    if debug_spi:
+                        print(f"[SPI调试] CLK拉高耗时: {set_end - set_start:.6f}s")
+                else:
+                    time.sleep(lag_time)  # 保持延迟
+                    if debug_spi:
+                        print(f"[SPI调试] CLK({clk_pin}) = 1 保持不变")
             
             time.sleep(lag_time)
             
