@@ -1,0 +1,123 @@
+# 键盘抽象层JSON结构说明
+
+## 概述
+
+键盘守护进程（daemon_keyboard）提供了一个基于Unix Socket的键盘事件监听接口。该守护进程通过UDP socket以JSON格式广播键盘输入事件。
+
+## Socket接口
+
+- **控制Socket**：`/tmp/keyboard.sock`（UDP）- 用于发送控制命令（目前未实现控制功能）
+- **状态监听Socket**：`/tmp/keyboard_get.sock`（UDP）- 用于接收键盘事件和状态查询
+
+## JSON数据结构
+
+### 1. 键盘事件消息
+
+当键盘上有按键操作时，守护进程会发送以下格式的消息（包含所有当前按键状态，支持组合键）：
+
+```json
+{
+    "type": "key_event",
+    "id": 123,
+    "timestamp": 1766666413.901518,
+    "event_type": "press",
+    "key": "END",
+    "key_code": 79,
+    "device": "/dev/input/event9",
+    "current_keys": {
+        "END": true,
+        "LEFT_CTRL": true,
+        "a": false
+    }
+}
+```
+
+**字段说明**：
+- `type`：消息类型，固定为"key_event"
+- `id`：消息ID，递增的唯一标识符
+- `timestamp`：事件发生的时间戳（秒）
+- `event_type`：触发此消息的事件类型，"press"表示按下，"release"表示释放
+- `key`：触发此消息的按键名称（如"END", "ENTER", "a"等）
+- `key_code`：触发此消息的按键的Linux键码（如79对应END键）
+- `device`：事件来源的设备路径（如"/dev/input/event9"）
+- `current_keys`：当前所有按键的状态，包含组合键信息，true表示按下，false表示释放
+
+### 2. 当前状态查询消息
+
+客户端发送给守护进程，用于获取当前键盘状态：
+
+```json
+{
+    "type": "query_status"
+}
+```
+
+**字段说明**：
+- `type`：消息类型，固定为"query_status"
+
+### 3. 当前键盘状态响应
+
+守护进程响应状态查询时发送以下格式消息：
+
+```json
+{
+    "type": "current_status",
+    "id": 124,
+    "timestamp": 1766666414.141522,
+    "current_keys": {
+        "END": false,
+        "ENTER": true,
+        "SPACE": false
+    },
+    "current_keys_timestamp": {
+        "ENTER": 1766666414.000123
+    }
+}
+```
+
+**字段说明**：
+- `type`：消息类型，固定为"current_status"
+- `id`：消息ID，递增的唯一标识符
+- `timestamp`：响应发送的时间戳
+- `current_keys`：当前所有按键的状态，true表示按下，false表示释放
+- `current_keys_timestamp`：当前处于按下状态的按键的按下时间戳
+
+## 客户端使用方法
+
+### 1. 监听键盘事件
+
+1. 创建UDP socket
+2. 向守护进程发送状态查询请求：`{"type": "query_status"}`
+3. 接收守护进程广播的事件消息
+
+### 2. 获取当前状态
+
+1. 向守护进程发送查询请求：`{"type": "query_status"}`
+2. 接收状态响应消息
+
+## 键码映射
+
+守护进程内置了Linux键码到可读键名的映射，包括：
+
+- 基本键：ESC, 1-0, A-Z, 等
+- 功能键：F1-F12, TAB, CAPS_LOCK, 等
+- 控制键：ENTER, BACKSPACE, SPACE, CTRL, ALT, SHIFT, 等
+- 方向键：UP, DOWN, LEFT, RIGHT, HOME, END, PAGE_UP, PAGE_DOWN
+- 数字键盘：NUM_LOCK, MINUS, PLUS, 等
+
+## 设备自动检测
+
+守护进程会自动检测系统中的键盘设备，包括：
+- USB键盘
+- PS/2键盘
+- 笔记本内置键盘
+- 多功能键盘（如带有消费者控制或系统控制功能的键盘）
+
+## 通信协议
+
+1. 客户端首先向`/tmp/keyboard_get.sock`发送一次查询请求
+2. 守护进程记录客户端地址
+3. 守护进程将所有键盘事件广播到所有已记录的客户端地址
+4. 客户端从其发送请求的同一socket接收事件
+
+这种设计解决了TCP缓冲区问题，确保事件的实时传递。
