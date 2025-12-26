@@ -21,11 +21,12 @@ import queue
 class USBGPIOController:
     """USB GPIO控制器类"""
     
-    def __init__(self, tty_path, baudrate=115200, simulate=False):
+    def __init__(self, tty_path, baudrate=115200, simulate=False, debug=False):
         self.tty_path = tty_path
         self.baudrate = baudrate
         self.ser = None
         self.simulate = simulate
+        self.debug = debug  # 添加调试标志
         self.gpio_states = {}  # 用于模拟模式下的GPIO状态
         
         # 添加一个状态跟踪字典，记录当前各GPIO引脚的状态
@@ -57,6 +58,11 @@ class USBGPIOController:
     
     def send_command(self, command):
         """发送命令到USB GPIO设备"""
+        
+        # 调试：打印发送的指令
+        if hasattr(self, 'debug') and self.debug:
+            print(f"调试: 发送指令 - {[hex(b) for b in command]}")
+        
         if self.simulate:
             # 模拟模式：解析命令并更新GPIO状态
             if command[0] == 0x3A:  # GPIO设置命令
@@ -103,11 +109,15 @@ class USBGPIOController:
         # 筛选出状态真正发生变化的GPIO
         changed_states = {}
         for pin, new_state in gpio_states.items():
+            # 确保GPIO引脚和状态是整数
+            gpio_pin = int(pin)
+            state = int(new_state)
+            
             # 检查是否是第一次设置或者状态是否发生了变化
-            current_state = self.current_gpio_states.get(pin)
-            if current_state is None or current_state != new_state:
-                changed_states[pin] = new_state
-                self.current_gpio_states[pin] = new_state  # 更新当前状态
+            current_state = self.current_gpio_states.get(gpio_pin)
+            if current_state is None or current_state != state:
+                changed_states[gpio_pin] = state
+                self.current_gpio_states[gpio_pin] = state  # 更新当前状态
         
         if not changed_states:
             # 如果没有状态变化，直接返回
@@ -314,6 +324,9 @@ class GPIOControlDaemon:
         self.gpio_change_buffer_last_send = time.time()
         self.gpio_change_buffer_send_interval = 0.05  # 50毫秒的缓冲间隔
         
+        # GPIO状态跟踪（用于查询功能）
+        self.current_gpio_states = {}
+        
         # 读取配置文件中的所有GPIO设备
         for section_name in self.config.sections():
             if section_name == 'daemon_config':
@@ -406,7 +419,7 @@ class GPIOControlDaemon:
         # 运行标志
         self.running = True
         
-        print(f"GPIO守护进程初始化完成 (模拟模式: {simulate}, 调试SPI: {debug_spi})")
+        print(f"GPIO守护进程初始化完成 (模拟模式: {simulate}, 调试SPI: {debug_spi}, 调试: {debug})")
     
     def handle_control_command(self, data, addr):
         """处理控制命令"""
@@ -414,6 +427,10 @@ class GPIOControlDaemon:
             command = json.loads(data.decode('utf-8'))
             alias = command.get('alias')
             mode = command.get('mode')
+            
+            # 调试：打印传入的命令
+            if hasattr(self, 'debug') and self.debug:
+                print(f"调试: 收到命令 - {command}")
             
             if alias not in self.controllers:
                 print(f"错误: 未找到别名为 {alias} 的控制器")
@@ -427,6 +444,11 @@ class GPIOControlDaemon:
                     # 单个GPIO控制
                     gpio = command['gpio']
                     value = command['value']
+                    
+                    # 调试：打印GPIO设置信息
+                    if hasattr(self, 'debug') and self.debug:
+                        print(f"调试: 设置GPIO {gpio} 为 {value}")
+                    
                     controller.set_gpio({gpio: value})
                 elif 'gpios' in command and 'values' in command:
                     # 批量GPIO控制
@@ -435,6 +457,11 @@ class GPIOControlDaemon:
                     if len(gpios) != len(values):
                         print("错误: gpios数组和values数组长度不匹配")
                         return
+                    
+                    # 调试：打印批量GPIO设置信息
+                    if hasattr(self, 'debug') and self.debug:
+                        print(f"调试: 批量设置GPIO - gpios: {gpios}, values: {values}")
+                    
                     gpio_states = dict(zip(gpios, values))
                     controller.set_gpio(gpio_states)
             
@@ -445,6 +472,11 @@ class GPIOControlDaemon:
                     'config': controller_config,
                     'command': command
                 }
+                
+                # 调试：打印SPI命令信息
+                if hasattr(self, 'debug') and self.debug:
+                    print(f"调试: SPI命令 - {command}")
+                
                 self.spi_queue.put(spi_task)
             
             elif mode == 'spi_multi' and controller_config['mode'] == 'spi':
@@ -454,6 +486,11 @@ class GPIOControlDaemon:
                     'config': controller_config,
                     'command': command
                 }
+                
+                # 调试：打印多路SPI命令信息
+                if hasattr(self, 'debug') and self.debug:
+                    print(f"调试: 多路SPI命令 - {command}")
+                
                 self.spi_queue.put(spi_task)
         
         except json.JSONDecodeError:
@@ -607,273 +644,189 @@ class GPIOControlDaemon:
                 self.gpio_default_states[alias] = default_bit
                 self.gpio_last_states[alias] = {}
         
-        # 持续监控GPIO状态变化
+        # 为每个geter控制器启动单独的监听线程
+        for alias, controller in self.controllers.items():
+            if self.controller_configs[alias]['mode'] == 'geter':
+                default_bit = self.gpio_default_states.get(alias, 0)
+                
+                # 对于geter模式，发送持续上报指令
+                if not controller.simulate:
+                    if not controller.ser or not controller.ser.is_open:
+                        try:
+                            controller.reconnect()
+                        except:
+                            continue
+                    
+                    # 发送持续上报指令
+                    if default_bit == 0:
+                        # 使用3E指令（拉低模式）启用持续GPIO状态上报
+                        command = bytearray([0x3E, 0xFF])
+                    else:
+                        # 使用3D指令（拉高模式）启用持续GPIO状态上报
+                        command = bytearray([0x3D, 0xFF])
+                    
+                    try:
+                        controller.ser.write(command)
+                        print(f"已发送GPIO持续上报指令到 {alias} 设备 (default_bit={default_bit})")
+                        self.gpio_reporting_active.add(alias)
+                    except Exception as e:
+                        print(f"发送GPIO持续上报指令失败: {e}")
+                else:
+                    # 模拟模式下标记为已激活
+                    self.gpio_reporting_active.add(alias)
+                
+                # 为每个geter控制器启动监听线程
+                if not controller.simulate:
+                    # 启动监听线程
+                    listen_thread = threading.Thread(
+                        target=self.listen_gpio_controller,
+                        args=(alias, controller, default_bit),
+                        daemon=True
+                    )
+                    listen_thread.start()
+                else:
+                    # 模拟模式：启动模拟监听线程
+                    simulate_thread = threading.Thread(
+                        target=self.simulate_gpio_controller,
+                        args=(alias, controller, default_bit),
+                        daemon=True
+                    )
+                    simulate_thread.start()
+        
+        # 主线程只负责处理缓冲区数据广播
         while self.running:
             try:
-                for alias, controller in self.controllers.items():
-                    if self.controller_configs[alias]['mode'] == 'geter':
-                        default_bit = self.gpio_default_states.get(alias, 0)
-                        
-                        # 对于geter模式，只发送一次持续上报指令
-                        if alias not in self.gpio_reporting_active:
-                            if not controller.simulate:
-                                if not controller.ser or not controller.ser.is_open:
-                                    try:
-                                        controller.reconnect()
-                                    except:
-                                        continue
-                                
-                                # 发送持续上报指令
-                                if default_bit == 0:
-                                    # 使用3E指令（拉低模式）启用持续GPIO状态上报
-                                    command = bytearray([0x3E, 0xFF])
-                                else:
-                                    # 使用3D指令（拉高模式）启用持续GPIO状态上报
-                                    command = bytearray([0x3D, 0xFF])
-                                
-                                try:
-                                    controller.ser.write(command)
-                                    print(f"已发送GPIO持续上报指令到 {alias} 设备 (default_bit={default_bit})")
-                                    self.gpio_reporting_active.add(alias)
-                                except Exception as e:
-                                    print(f"发送GPIO持续上报指令失败: {e}")
-                            else:
-                                # 模拟模式下标记为已激活
-                                self.gpio_reporting_active.add(alias)
-                        
-                        # 处理geter模式下的持续上报数据
-                        if not controller.simulate:
-                            try:
-                                # 检查是否有可读取的数据
-                                if controller.ser.in_waiting > 0:
-                                    response_data = controller.ser.read(controller.ser.in_waiting)
-                                    
-                                    if response_data:
-                                        # 解析响应数据，格式为 "CH1:0 CH2:1 CH3:0 ..."
-                                        response_str = response_data.decode('ascii', errors='ignore').strip()
-                                        
-                                        # 按行分割可能的多条状态更新
-                                        for line in response_str.splitlines():
-                                            line = line.strip()
-                                            if line:
-                                                # 提取所有CHx:y格式的数据
-                                                import re
-                                                matches = re.findall(r'CH(\d+):([01])', line)
-                                                
-                                                if matches:
-                                                    gpio_states = {}
-                                                    for gpio_num, state in matches:
-                                                        gpio_num = int(gpio_num)
-                                                        state = int(state)
-                                                        gpio_states[gpio_num] = state
-                                                    
-                                                    # 更新当前GPIO状态（用于查询功能）
-                                                    if alias not in self.current_gpio_states:
-                                                        self.current_gpio_states[alias] = {}
-                                                    self.current_gpio_states[alias].update(gpio_states)
-                                                    
-                                                    # 检查每个GPIO的状态变化
-                                                    for gpio_pin, current_state in gpio_states.items():
-                                                        last_state = self.gpio_last_states[alias].get(gpio_pin)
-                                                        
-                                                        if last_state is not None and last_state != current_state:
-                                                            # 发现状态变化，广播给客户端
-                                                            # default_bit表示配置的查询电平指令集类型（0=3E指令拉低检测，1=3D指令拉高检测）
-                                                            status_data = {
-                                                                "gpios": [
-                                                                    {
-                                                                        "alias": alias,
-                                                                        "default_bit": default_bit,
-                                                                        "change_gpio": [
-                                                                            {
-                                                                                "gpio": gpio_pin,
-                                                                                "bit": current_state
-                                                                            }
-                                                                        ]
-                                                                    }
-                                                                ]
-                                                            }
-                                                            self.broadcast_gpio_status(status_data)
-                                                        
-                                                        # 更新最后状态
-                                                        self.gpio_last_states[alias][gpio_pin] = current_state
-                            except Exception as e:
-                                print(f"读取GPIO持续上报数据失败: {e}")
-                                # 尝试重新连接
-                                try:
-                                    controller.reconnect()
-                                    # 重新发送持续上报指令
-                                    self.gpio_reporting_active.discard(alias)
-                                except:
-                                    pass
-                        else:
-                            # 模拟模式：定期生成模拟数据
-                            import random
-                            time.sleep(0.05)  # 模拟读取延迟
-                            gpio_states = {}
-                            for gpio_pin in range(1, 17):
-                                current_state = random.randint(0, 1)
-                                gpio_states[gpio_pin] = current_state
-                            
-                            # 更新当前GPIO状态（用于查询功能）
-                            if alias not in self.current_gpio_states:
-                                self.current_gpio_states[alias] = {}
-                            self.current_gpio_states[alias].update(gpio_states)
-                            
-                            # 检查每个GPIO的状态变化
-                            for gpio_pin, current_state in gpio_states.items():
-                                last_state = self.gpio_last_states[alias].get(gpio_pin)
-                                
-                                if last_state is not None and last_state != current_state:
-                                    status_data = {
-                                        "gpios": [
-                                            {
-                                                "alias": alias,
-                                                "default_bit": default_bit,
-                                                "change_gpio": [
-                                                    {
-                                                        "gpio": gpio_pin,
-                                                        "bit": current_state
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                    self.broadcast_gpio_status(status_data)
-                                
-                                # 更新最后状态
-                                self.gpio_last_states[alias][gpio_pin] = current_state
-                
                 # 检查是否需要发送缓冲区数据
                 current_time = time.time()
                 if current_time - self.gpio_change_buffer_last_send >= self.gpio_change_buffer_send_interval:
                     self.send_buffered_gpio_status()
                     self.gpio_change_buffer_last_send = current_time
                 
-                time.sleep(0.01)  # 减少延迟以更好地处理持续上报数据
+                # 主线程休眠一段时间，避免过度占用CPU
+                time.sleep(0.05)
+                
             except Exception as e:
-                print(f"GPIO监控线程发生错误: {e}")
+                print(f"GPIO监控主线程发生错误: {e}")
                 time.sleep(1)
     
-    def __init__(self, config_path, simulate=False, debug_spi=False):
-        self.config = configparser.ConfigParser()
-        self.config.read(config_path)
+    def listen_gpio_controller(self, alias, controller, default_bit):
+        """监听单个GPIO控制器的数据上报"""
+        print(f"开始监听GPIO控制器: {alias}")
         
-        # 是否使用模拟模式和调试SPI
-        self.simulate = simulate
-        self.debug_spi = debug_spi
-        
-        # 初始化USB GPIO控制器
-        self.controllers = {}
-        self.controller_configs = {}
-        
-        # GPIO状态变化缓冲区和相关锁
-        self.gpio_change_buffer = {}
-        self.gpio_change_buffer_lock = threading.Lock()
-        self.gpio_change_buffer_last_send = time.time()
-        self.gpio_change_buffer_send_interval = 0.05  # 50毫秒的缓冲间隔
-        
-        # 用于跟踪GPIO持续上报指令的激活状态
-        self.gpio_reporting_active = set()
-        
-        # 消息ID计数器，用于ACK机制
-        self.message_id_counter = 0
-        self.message_id_lock = threading.Lock()
-        
-        # 存储当前GPIO状态
-        self.current_gpio_states = {}
-        
-        # 读取配置文件中的所有GPIO设备
-        for section_name in self.config.sections():
-            if section_name == 'daemon_config':
-                continue
-            
-            tty_path = self.config.get(section_name, 'tty_path')
-            baudrate = self.config.getint(section_name, 'baudrate', fallback=115200)
-            alias = self.config.get(section_name, 'alias')
-            mode = self.config.get(section_name, 'mode')
-            
+        while self.running:
             try:
-                controller = USBGPIOController(tty_path, baudrate, simulate=simulate)
-                self.controllers[alias] = controller
-                self.controller_configs[alias] = {
-                    'mode': mode,
-                    'config': dict(self.config.items(section_name))
-                }
-                
-                # 如果是SPI模式，提取SPI引脚配置
-                if mode == 'spi':
-                    spi_pins = {}
-                    for key, value in self.controller_configs[alias]['config'].items():
-                        if key.startswith(('clk_', 'data_', 'cs_')):
-                            # 去除可能的注释部分（以#开头的内容）
-                            clean_value = value.split('#')[0].strip()
-                            if clean_value:  # 确保去除注释后还有有效内容
-                                try:
-                                    spi_pins[key] = int(clean_value)
-                                except ValueError:
-                                    print(f"警告: 无法将 '{key}' 的值 '{value}' 转换为整数，跳过该配置")
-                    self.controller_configs[alias]['spi_pins'] = spi_pins
-            except Exception as e:
-                if not simulate:
-                    print(f"初始化控制器 {alias} 失败: {e}")
-                    print("尝试使用模拟模式...")
-                    try:
-                        controller = USBGPIOController(tty_path, baudrate, simulate=True)
-                        self.controllers[alias] = controller
-                        self.controller_configs[alias] = {
-                            'mode': mode,
-                            'config': dict(self.config.items(section_name))
-                        }
+                # 检查串口是否有数据可用
+                if controller.ser.in_waiting > 0:
+                    # 读取所有可用数据
+                    response_data = controller.ser.read(controller.ser.in_waiting)
+                    
+                    if response_data:
+                        # 解析响应数据，格式为 "CH1:0 CH2:1 CH3:0 ..."
+                        response_str = response_data.decode('ascii', errors='ignore').strip()
                         
-                        # 如果是SPI模式，提取SPI引脚配置
-                        if mode == 'spi':
-                            spi_pins = {}
-                            for key, value in self.controller_configs[alias]['config'].items():
-                                if key.startswith(('clk_', 'data_', 'cs_')):
-                                    # 去除可能的注释部分（以#开头的内容）
-                                    clean_value = value.split('#')[0].strip()
-                                    if clean_value:  # 确保去除注释后还有有效内容
-                                        try:
-                                            spi_pins[key] = int(clean_value)
-                                        except ValueError:
-                                            print(f"警告: 无法将 '{key}' 的值 '{value}' 转换为整数，跳过该配置")
-                            self.controller_configs[alias]['spi_pins'] = spi_pins
-                    except Exception as e2:
-                        print(f"即使在模拟模式下初始化控制器 {alias} 也失败: {e2}")
+                        # 按行分割可能的多条状态更新
+                        for line in response_str.splitlines():
+                            line = line.strip()
+                            if line:
+                                # 提取所有CHx:y格式的数据
+                                import re
+                                matches = re.findall(r'CH(\d+):([01])', line)
+                                
+                                if matches:
+                                    gpio_states = {}
+                                    for gpio_num, state in matches:
+                                        gpio_num = int(gpio_num)
+                                        state = int(state)
+                                        gpio_states[gpio_num] = state
+                                    
+                                    # 更新当前GPIO状态（用于查询功能）
+                                    if alias not in self.current_gpio_states:
+                                        self.current_gpio_states[alias] = {}
+                                    self.current_gpio_states[alias].update(gpio_states)
+                                    
+                                    # 检查每个GPIO的状态变化
+                                    for gpio_pin, current_state in gpio_states.items():
+                                        last_state = self.gpio_last_states[alias].get(gpio_pin)
+                                        
+                                        if last_state is not None and last_state != current_state:
+                                            # 发现状态变化，广播给客户端
+                                            # default_bit表示配置的查询电平指令集类型（0=3E指令拉低检测，1=3D指令拉高检测）
+                                            status_data = {
+                                                "gpios": [
+                                                    {
+                                                        "alias": alias,
+                                                        "default_bit": default_bit,
+                                                        "change_gpio": [
+                                                            {
+                                                                "gpio": gpio_pin,
+                                                                "bit": current_state
+                                                            }
+                                                        ]
+                                                    }
+                                                ]
+                                            }
+                                            self.broadcast_gpio_status(status_data)
+                                        
+                                        # 更新最后状态
+                                        self.gpio_last_states[alias][gpio_pin] = current_state
                 else:
-                    print(f"在模拟模式下初始化控制器 {alias} 失败: {e}")
+                    # 没有数据时短暂休眠，避免过度占用CPU
+                    time.sleep(0.001)
+                    
+            except Exception as e:
+                print(f"监听GPIO控制器 {alias} 时发生错误: {e}")
+                time.sleep(1)  # 出错时稍长的休眠
+                # 尝试重新连接
+                try:
+                    controller.reconnect()
+                    # 重新发送持续上报指令
+                    self.gpio_reporting_active.discard(alias)
+                except:
+                    pass
+    
+    def simulate_gpio_controller(self, alias, controller, default_bit):
+        """模拟GPIO控制器的数据上报"""
+        import random
         
-        # 创建控制Socket
-        socket_path = self.config.get('daemon_config', 'socket_path', fallback='/tmp/gpio.sock')
-        if os.path.exists(socket_path):
-            os.unlink(socket_path)
-        
-        self.control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.control_socket.bind(socket_path)
-        os.chmod(socket_path, 0o777)  # 设置权限以便其他进程访问
-        
-        # 创建状态监听Socket
-        get_status_path = self.config.get('daemon_config', 'get_statu_path', fallback='/tmp/gpio_get.sock')
-        if os.path.exists(get_status_path):
-            os.unlink(get_status_path)
-        
-        self.status_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.status_socket.bind(get_status_path)
-        self.status_socket.listen(10)  # 最多允许10个并发连接
-        os.chmod(get_status_path, 0o777)
-        
-        # 存储状态监听客户端
-        self.status_clients = []
-        self.status_clients_lock = threading.Lock()
-        
-        # 为SPI操作添加队列和锁，确保SPI操作串行执行
-        self.spi_queue = queue.Queue()
-        self.spi_processing_lock = threading.Lock()  # 确保SPI处理的互斥性
-        self.spi_worker_thread = None
-        
-        # 运行标志
-        self.running = True
+        while self.running:
+            # 模拟定期生成数据
+            time.sleep(0.1)  # 模拟数据生成间隔
+            
+            gpio_states = {}
+            for gpio_pin in range(1, 17):
+                current_state = random.randint(0, 1)
+                gpio_states[gpio_pin] = current_state
+            
+            # 更新当前GPIO状态（用于查询功能）
+            if alias not in self.current_gpio_states:
+                self.current_gpio_states[alias] = {}
+            self.current_gpio_states[alias].update(gpio_states)
+            
+            # 检查每个GPIO的状态变化
+            for gpio_pin, current_state in gpio_states.items():
+                last_state = self.gpio_last_states[alias].get(gpio_pin)
+                
+                if last_state is not None and last_state != current_state:
+                    status_data = {
+                        "gpios": [
+                            {
+                                "alias": alias,
+                                "default_bit": default_bit,
+                                "change_gpio": [
+                                    {
+                                        "gpio": gpio_pin,
+                                        "bit": current_state
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                    self.broadcast_gpio_status(status_data)
+                
+                # 更新最后状态
+                self.gpio_last_states[alias][gpio_pin] = current_state
+    
+
         
         print(f"GPIO守护进程初始化完成 (模拟模式: {simulate}, 调试SPI: {debug_spi})")
     
@@ -1099,7 +1052,9 @@ if __name__ == '__main__':
     # 检查命令行参数
     simulate = '--simulate' in sys.argv or '-s' in sys.argv
     debug_spi = '--debug-spi' in sys.argv
+    debug = '--debug' in sys.argv or '-d' in sys.argv
     
     config_path = os.path.join(os.path.dirname(__file__), 'config', 'config.ini')
     daemon = GPIOControlDaemon(config_path, simulate=simulate, debug_spi=debug_spi)
+    daemon.debug = debug  # 添加调试标志
     daemon.run()

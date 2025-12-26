@@ -16,7 +16,7 @@ import configparser
 class HT1621Daemon:
     """HT1621守护进程类"""
     
-    def __init__(self, config_path="/home/xmb505/智能外卖柜样机/deamon/daemon_ht1621/config/config.ini"):
+    def __init__(self, config_path="/home/xmb505/智能外卖柜样机/deamon/daemon_ht1621/config/config.ini", debug=False):
         # 创建一个区分大小写的配置解析器
         self.config = configparser.ConfigParser()
         # 设置选项名称保持原样（区分大小写）
@@ -26,6 +26,7 @@ class HT1621Daemon:
         self.gpio_socket_path = self.config.get('daemon_config', 'gpio_socket_path', fallback='/tmp/gpio.sock')
         self.ht1621_socket_path = self.config.get('daemon_config', 'ht1621_socket_path', fallback='/tmp/ht1621.sock')
         self.running = True
+        self.debug = debug  # 添加调试标志
         
         # 从配置文件读取段码表 (从font_data段)
         self.digit_to_segments = {}
@@ -66,6 +67,10 @@ class HT1621Daemon:
     
     def send_to_gpio(self, data):
         """发送数据到GPIO守护进程"""
+        # 调试：打印发送的数据
+        if hasattr(self, 'debug') and self.debug:
+            print(f"调试: 发送到GPIO守护进程 - {data}")
+        
         try:
             self.gpio_sock.sendto(data.encode('utf-8'), self.gpio_socket_path)
             return True
@@ -282,7 +287,11 @@ class HT1621Daemon:
 
 
 def main():
-    daemon = HT1621Daemon()
+    import sys
+    # 检查命令行参数
+    debug = '--debug' in sys.argv or '-d' in sys.argv
+    
+    daemon = HT1621Daemon(debug=debug)
     try:
         daemon.start_server()
     except KeyboardInterrupt:
