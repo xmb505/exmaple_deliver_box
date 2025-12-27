@@ -324,6 +324,10 @@ class GPIOControlDaemon:
         self.gpio_change_buffer_last_send = time.time()
         self.gpio_change_buffer_send_interval = 0.05  # 50毫秒的缓冲间隔
         
+        # 消息ID生成相关
+        self.message_id_counter = 0
+        self.message_id_lock = threading.Lock()
+        
         # GPIO状态跟踪（用于查询功能）
         self.current_gpio_states = {}
         
@@ -419,7 +423,7 @@ class GPIOControlDaemon:
         # 运行标志
         self.running = True
         
-        print(f"GPIO守护进程初始化完成 (模拟模式: {simulate}, 调试SPI: {debug_spi}, 调试: {debug})")
+        print(f"GPIO守护进程初始化完成 (模拟模式: {simulate}, 调试SPI: {debug_spi})")
     
     def handle_control_command(self, data, addr):
         """处理控制命令"""
@@ -701,9 +705,16 @@ class GPIOControlDaemon:
                 if current_time - self.gpio_change_buffer_last_send >= self.gpio_change_buffer_send_interval:
                     self.send_buffered_gpio_status()
                     self.gpio_change_buffer_last_send = current_time
-                
-                # 主线程休眠一段时间，避免过度占用CPU
-                time.sleep(0.05)
+                    
+                    # 计算距离下一次发送的时间间隔
+                    time_since_last_send = time.time() - self.gpio_change_buffer_last_send
+                    wait_time = max(0.01, self.gpio_change_buffer_send_interval - time_since_last_send)
+                    time.sleep(wait_time)
+                else:
+                    # 距离下一次发送还有时间，等待剩余时间
+                    remaining_time = self.gpio_change_buffer_send_interval - (current_time - self.gpio_change_buffer_last_send)
+                    wait_time = max(0.01, remaining_time)
+                    time.sleep(wait_time)
                 
             except Exception as e:
                 print(f"GPIO监控主线程发生错误: {e}")
@@ -715,8 +726,11 @@ class GPIOControlDaemon:
         
         while self.running:
             try:
-                # 检查串口是否有数据可用
-                if controller.ser.in_waiting > 0:
+                # 使用select来监听串口数据，避免轮询+sleep
+                # select会阻塞直到有数据可读
+                ready, _, _ = select.select([controller.ser], [], [], 0.1)
+                
+                if ready:
                     # 读取所有可用数据
                     response_data = controller.ser.read(controller.ser.in_waiting)
                     
@@ -769,13 +783,9 @@ class GPIOControlDaemon:
                                         
                                         # 更新最后状态
                                         self.gpio_last_states[alias][gpio_pin] = current_state
-                else:
-                    # 没有数据时短暂休眠，避免过度占用CPU
-                    time.sleep(0.001)
                     
             except Exception as e:
                 print(f"监听GPIO控制器 {alias} 时发生错误: {e}")
-                time.sleep(1)  # 出错时稍长的休眠
                 # 尝试重新连接
                 try:
                     controller.reconnect()
