@@ -75,6 +75,15 @@ def listen_gpio_events(socket_path, query_interval=None):
             print(f"将每 {query_interval} 秒查询一次当前GPIO状态")
         print("-" * 50)
         
+        # 连接成功后立即查询一次当前GPIO状态，模拟开机时获取初始状态
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 正在获取初始GPIO状态（模拟开机状态）...")
+        if send_status_query(sock):
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 已发送初始状态查询请求")
+            # 等待一小段时间接收响应
+            time.sleep(0.5)
+        else:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 初始状态查询请求发送失败")
+        
         # 启动定期查询线程（如果指定了查询间隔）
         query_thread = None
         if query_interval:
