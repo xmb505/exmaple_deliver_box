@@ -21,7 +21,7 @@
 
 ### 系统架构图
 ```
-应用层 (待实现)
+应用层 (开发中)
     ↓
 Unix Socket接口层
     ↓
@@ -71,6 +71,14 @@ Unix Socket接口层
 #### 4. daemon_all - 总守护进程
 **位置**: `deamon/daemon_all/`
 **功能**: 负责启动和管理其他守护进程
+
+#### 5. application - 应用层
+**位置**: `application/`
+**状态**: 开发中
+
+**目录结构**:
+- `config/`: 应用层配置文件
+- `doc/`: 应用层文档，包括GPIO映射表等
 
 ## 构建和运行
 
@@ -146,12 +154,14 @@ python3 ht1621_test.py init
 #### 3. GPIO状态监听工具
 ```bash
 cd debug_utils
-# 基本监听
+# 基本监听（启动时会自动获取初始GPIO状态）
 python3 gpio_read.py --socket_path /tmp/gpio_get.sock
 
 # 定期查询当前状态（每30秒）
-python3 gpio_read.py --socket-path /tmp/gpio_get.sock --query-interval 30
+python3 gpio_read.py --socket_path /tmp/gpio_get.sock --query-interval 30
 ```
+
+**重要说明**：gpio_read.py 在启动时会自动发送一次状态查询请求，获取所有GPIO的初始状态。这模拟了系统开机时需要知道柜内是否有物品的场景，确保应用层能够获取到初始的GPIO状态。这对于实现开机状态同步非常重要。
 
 #### 4. 键盘输入监听工具
 ```bash
@@ -434,9 +444,10 @@ grep -i error gpio_daemon.log
 - ✅ 测试工具：完整的调试工具集（gpio_read, keyboard_read等）
 - ✅ 事件驱动机制：使用select实现真正的异步监听
 - ✅ 性能优化：针对MIPS平台优化，减少CPU占用
+- ✅ 初始状态查询：gpio_read.py启动时自动获取GPIO初始状态
 
 ### 待实现
-- ❌ 应用层：业务逻辑和用户界面
+- 🔄 应用层：业务逻辑和用户界面（开发中）
 - ❌ 错误处理：异常恢复机制
 - ❌ 日志系统：结构化日志记录
 - ❌ 监控功能：系统状态监控
@@ -484,6 +495,11 @@ cat /sys/class/input/event*/device/name
 - 检查default_bit配置是否正确
 - 使用gpio_read.py工具测试连接
 
+#### 6. 初始GPIO状态未获取
+- 确认gpio_read.py启动后是否发送了状态查询请求
+- 检查守护进程是否正确响应query_status请求
+- 查看gpio_read.py的输出日志
+
 ## 扩展开发
 
 ### 添加新的守护进程
@@ -515,7 +531,12 @@ cat /sys/class/input/event*/device/name
 
 ## 版本历史
 
-### v1.1 (当前版本)
+### v1.2 (当前版本)
+- 新增应用层目录结构
+- gpio_read.py增加初始状态查询功能，模拟开机状态获取
+- 完善项目文档，添加应用层架构说明
+
+### v1.1
 - 新增键盘输入守护进程（daemon_keyboard）
 - 实现事件驱动机制，使用select监听串口数据
 - 优化性能，减少CPU占用，适合MIPS平台
