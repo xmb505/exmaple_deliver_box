@@ -2,6 +2,7 @@
 """
 键盘守护进程
 监听键盘输入事件并通过Unix Socket广播
+采用事件驱动机制，使用select监听输入设备数据
 """
 
 import json
@@ -10,9 +11,9 @@ import threading
 import time
 import os
 import select
-import queue
-from pathlib import Path
+import struct
 import configparser
+import glob
 
 
 def find_keyboard_devices():
@@ -20,8 +21,6 @@ def find_keyboard_devices():
     自动查找系统中的键盘设备
     返回键盘设备路径列表
     """
-    import glob
-    
     keyboard_devices = []
     
     # 遍历所有输入事件设备
@@ -52,12 +51,13 @@ def find_keyboard_devices():
 class KeyboardEventDaemon:
     """键盘事件守护进程"""
     
-    def __init__(self, config_path, simulate=False):
+    def __init__(self, config_path, simulate=False, debug=False):
         self.config = configparser.ConfigParser()
         self.config.read(config_path)
         
-        # 是否使用模拟模式
+        # 是否使用模拟模式和调试模式
         self.simulate = simulate
+        self.debug = debug
         
         # 存储当前按键状态（跟踪所有按键的按下/释放状态）
         self.current_keys = {}  # {key_name: state}，state为True表示按下，False表示释放
@@ -68,21 +68,24 @@ class KeyboardEventDaemon:
         # 自动查找键盘设备
         self.keyboard_devices = find_keyboard_devices()
         
-        # 创建控制Socket
+        # 键盘设备文件描述符列表
+        self.device_fds = []
+        
+        # 创建控制Socket（UDP）
         socket_path = self.config.get('daemon_config', 'socket_path', fallback='/tmp/keyboard.sock')
         if os.path.exists(socket_path):
             os.unlink(socket_path)
         
         self.control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.control_socket.bind(socket_path)
-        os.chmod(socket_path, 0o777)  # 设置权限以便其他进程访问
+        os.chmod(socket_path, 0o777)
         
-        # 创建状态监听Socket（改为UDP以支持广播）
+        # 创建状态监听Socket（UDP）
         get_status_path = self.config.get('daemon_config', 'get_statu_path', fallback='/tmp/keyboard_get.sock')
         if os.path.exists(get_status_path):
             os.unlink(get_status_path)
         
-        self.status_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)  # 改为UDP
+        self.status_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.status_socket.bind(get_status_path)
         os.chmod(get_status_path, 0o777)
         
@@ -90,17 +93,14 @@ class KeyboardEventDaemon:
         self.client_addresses = set()
         self.client_addresses_lock = threading.Lock()
         
-        # 键盘事件队列
-        self.key_event_queue = queue.Queue()
-        
         # 消息ID计数器
         self.message_id_counter = 0
         self.message_id_lock = threading.Lock()
         
         # 运行标志
-        self.running = True
+        self.running = False
         
-        print(f"键盘守护进程初始化完成 (模拟模式: {simulate})")
+        print(f"键盘守护进程初始化完成 (模拟模式: {simulate}, 调试模式: {debug})")
         print(f"发现 {len(self.keyboard_devices)} 个键盘设备: {self.keyboard_devices}")
     
     def get_next_message_id(self):
@@ -113,6 +113,11 @@ class KeyboardEventDaemon:
         """处理控制命令"""
         try:
             command = json.loads(data.decode('utf-8'))
+            
+            # 调试：打印传入的命令
+            if self.debug:
+                print(f"调试: 收到控制命令 - {command}")
+            
             # 目前键盘守护进程主要作用是监听和广播键盘事件
             # 可以扩展支持一些控制命令
             
@@ -134,6 +139,10 @@ class KeyboardEventDaemon:
             "current_keys": dict(self.current_keys),  # 包含所有当前按键状态
             **{k: v for k, v in event_data.items() if k not in ['type', 'id', 'timestamp']}
         }
+        
+        # 调试：打印广播的消息
+        if self.debug:
+            print(f"调试: 广播键盘事件 - {message_data}")
         
         with self.client_addresses_lock:
             disconnected_clients = []
@@ -173,45 +182,45 @@ class KeyboardEventDaemon:
         except Exception as e:
             print(f"向客户端 {client_addr} 发送状态失败: {e}")
     
-    def handle_status_messages(self):
-        """处理状态监听端口的消息（客户端查询等）"""
-        while self.running:
+    def open_keyboard_devices(self):
+        """打开所有键盘设备文件"""
+        self.device_fds = []
+        
+        if self.simulate:
+            # 模拟模式不需要打开实际设备
+            return True
+        
+        for device_path in self.keyboard_devices:
             try:
-                data, addr = self.status_socket.recvfrom(1024)
+                fd = open(device_path, 'rb')
                 
-                try:
-                    # 解析客户端发送的消息
-                    client_msg = json.loads(data.decode('utf-8'))
-                    
-                    # 记录客户端地址以便后续广播（仅在收到有效消息时）
-                    with self.client_addresses_lock:
-                        self.client_addresses.add(addr)
-                    
-                    # 处理ACK消息
-                    if client_msg.get('type') == 'ack':
-                        ack_id = client_msg.get('id')
-                        # 可以在这里添加ACK处理逻辑
-                        print(f"收到客户端ACK: {ack_id}")
-                    
-                    # 处理状态查询请求
-                    elif client_msg.get('type') == 'query_status':
-                        self.send_current_status(addr)
-                        
-                except json.JSONDecodeError:
-                    # 不是JSON格式的消息，可能是其他协议
-                    pass
-                        
-            except socket.timeout:
-                # 超时是正常的，继续循环
-                continue
+                # 设置为非阻塞模式
+                import fcntl
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+                
+                self.device_fds.append((fd, device_path))
+                print(f"已打开键盘设备: {device_path}")
             except Exception as e:
-                # 可能是socket被关闭了
-                if self.running:
-                    print(f"接收客户端消息时出错: {e}")
-                break
+                print(f"无法打开设备 {device_path}: {e}")
+        
+        if not self.device_fds:
+            print("错误: 无法打开任何键盘设备")
+            return False
+        
+        return True
+    
+    def close_keyboard_devices(self):
+        """关闭所有键盘设备文件"""
+        for fd, device_path in self.device_fds:
+            try:
+                fd.close()
+            except Exception as e:
+                print(f"关闭设备 {device_path} 失败: {e}")
+        self.device_fds = []
     
     def keyboard_monitoring(self):
-        """键盘监控线程"""
+        """键盘监控线程 - 使用select监听输入设备"""
         import random
         import string
         
@@ -244,37 +253,21 @@ class KeyboardEventDaemon:
                 
                 time.sleep(1)
         else:
-            # 使用evdev库监听实际键盘事件
-            try:
-                import struct
-                import select
-                
-                # 打开所有检测到的键盘设备
-                device_fds = []
-                for device_path in self.keyboard_devices:
-                    try:
-                        fd = open(device_path, 'rb')
-                        device_fds.append((fd, device_path))
-                        print(f"已打开键盘设备: {device_path}")
-                    except Exception as e:
-                        print(f"无法打开设备 {device_path}: {e}")
-                
-                if not device_fds:
-                    print("错误: 无法打开任何键盘设备")
-                    return
-                
-                # 将所有设备文件描述符设置为非阻塞模式
-                for fd, device_path in device_fds:
-                    import fcntl
-                    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-                    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-                
-                # 使用select来同时监控所有设备
-                while self.running:
-                    # 等待设备输入
-                    ready_fds, _, _ = select.select([fd for fd, _ in device_fds], [], [], 0.1)
+            # 使用select监听实际键盘设备
+            while self.running:
+                try:
+                    # 获取所有设备文件描述符
+                    fds = [fd for fd, _ in self.device_fds]
                     
-                    for ready_fd, device_path in device_fds:
+                    if not fds:
+                        # 没有设备可监听，等待并重试
+                        time.sleep(1)
+                        continue
+                    
+                    # 使用select监听设备输入，超时时间0.1秒
+                    ready_fds, _, _ = select.select(fds, [], [], 0.1)
+                    
+                    for ready_fd, device_path in self.device_fds:
                         if ready_fd in ready_fds:
                             # 一次性读取所有可用的数据
                             try:
@@ -328,7 +321,8 @@ class KeyboardEventDaemon:
                                             # 只广播按键按下和释放事件，忽略重复事件
                                             if event_type_str in ['press', 'release']:
                                                 self.broadcast_key_event(event_data)
-                                                print(f"键盘事件: {event_data}")
+                                                if self.debug:
+                                                    print(f"键盘事件: {event_data}")
                                                 
                                     except BlockingIOError:
                                         # 没有更多数据可读，跳出内部循环
@@ -341,71 +335,13 @@ class KeyboardEventDaemon:
                             except Exception as e:
                                 # 设备可能已断开，尝试重新打开
                                 print(f"读取设备 {device_path} 时出错: {e}")
-                                try:
-                                    ready_fd.close()
-                                    # 尝试重新打开设备
-                                    new_fd = open(device_path, 'rb')
-                                    # 将新文件描述符也设为非阻塞
-                                    import fcntl
-                                    fl = fcntl.fcntl(new_fd, fcntl.F_GETFL)
-                                    fcntl.fcntl(new_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-                                    # 替换文件描述符
-                                    for i, (fd, path) in enumerate(device_fds):
-                                        if path == device_path:
-                                            device_fds[i] = (new_fd, path)
-                                            break
-                                except Exception as reopen_error:
-                                    print(f"重新打开设备 {device_path} 失败: {reopen_error}")
-                                    # 从列表中移除该设备
-                                    device_fds = [(fd, path) for fd, path in device_fds if path != device_path]
-                
-            except ImportError:
-                print("错误: 未安装必要库，无法监听键盘事件")
-                print("请运行: pip install evdev (可选)")
-                # 作为备选方案，尝试使用keyboard库
-                try:
-                    import keyboard
-                    
-                    def on_key_event(event):
-                        # 确定事件类型
-                        if event.event_type == "down":
-                            event_type_str = "press"
-                            # 更新当前按键状态
-                            self.current_keys[event.name] = True
-                            self.current_keys_timestamp[event.name] = time.time()
-                        elif event.event_type == "up":
-                            event_type_str = "release"
-                            # 更新当前按键状态
-                            self.current_keys[event.name] = False
-                            if event.name in self.current_keys_timestamp:
-                                del self.current_keys_timestamp[event.name]
-                        else:
-                            event_type_str = event.event_type
-                        
-                        # 创建键盘事件数据
-                        event_data = {
-                            "event_type": event_type_str,
-                            "key": event.name,
-                            "timestamp": time.time()
-                        }
-                        
-                        self.broadcast_key_event(event_data)
-                        print(f"键盘事件: {event_data}")
-                    
-                    # 注册键盘事件监听器
-                    keyboard.hook(on_key_event)
-                    
-                    # 保持线程运行
-                    while self.running:
-                        time.sleep(0.1)
-                        
-                except ImportError:
-                    print("错误: 未安装keyboard库，无法监听键盘事件")
-                    print("请运行: pip install keyboard")
-                    time.sleep(5)  # 等待5秒后退出
+                                self.close_keyboard_devices()
+                                time.sleep(1)
+                                self.open_keyboard_devices()
+                                
                 except Exception as e:
-                    print(f"键盘监听错误: {e}")
-                    time.sleep(1)  # 出错后等待1秒再重试
+                    print(f"键盘监控线程发生错误: {e}")
+                    time.sleep(1)
     
     def get_key_name(self, key_code):
         """将键码转换为可读的键名"""
@@ -428,23 +364,33 @@ class KeyboardEventDaemon:
     def run(self):
         """运行守护进程"""
         print("键盘守护进程启动...")
+        self.running = True
         
-        # 启动状态消息处理线程（UDP）
-        status_thread = threading.Thread(target=self.handle_status_messages, daemon=True)
-        status_thread.start()
+        # 打开键盘设备
+        if not self.open_keyboard_devices():
+            print("无法打开键盘设备，守护进程启动失败")
+            self.stop()
+            return
         
         # 启动键盘监控线程
         keyboard_thread = threading.Thread(target=self.keyboard_monitoring, daemon=True)
         keyboard_thread.start()
         
-        # 主循环 - 处理控制命令
+        # 主循环 - 处理控制命令和状态查询
         while self.running:
             try:
                 # 使用select来实现非阻塞的socket监听
-                ready_sockets, _, _ = select.select([self.control_socket], [], [], 1.0)
+                # 同时监听控制socket和状态socket
+                ready_sockets, _, _ = select.select(
+                    [self.control_socket, self.status_socket],
+                    [],
+                    [],
+                    1.0
+                )
                 
                 for sock in ready_sockets:
                     if sock == self.control_socket:
+                        # 处理控制命令
                         data, addr = sock.recvfrom(1024)
                         if data:
                             # 使用线程处理命令，避免阻塞主循环
@@ -454,7 +400,32 @@ class KeyboardEventDaemon:
                                 daemon=True
                             )
                             command_thread.start()
-            
+                    
+                    elif sock == self.status_socket:
+                        # 处理状态查询
+                        data, addr = sock.recvfrom(1024)
+                        if data:
+                            try:
+                                client_msg = json.loads(data.decode('utf-8'))
+                                
+                                # 记录客户端地址以便后续广播
+                                with self.client_addresses_lock:
+                                    self.client_addresses.add(addr)
+                                
+                                # 处理ACK消息
+                                if client_msg.get('type') == 'ack':
+                                    ack_id = client_msg.get('id')
+                                    if self.debug:
+                                        print(f"收到客户端ACK: {ack_id}")
+                                
+                                # 处理状态查询请求
+                                elif client_msg.get('type') == 'query_status':
+                                    self.send_current_status(addr)
+                                    
+                            except json.JSONDecodeError:
+                                # 不是JSON格式的消息，忽略
+                                pass
+                                    
             except KeyboardInterrupt:
                 print("接收到中断信号")
                 self.stop()
@@ -466,8 +437,14 @@ class KeyboardEventDaemon:
     
     def stop(self):
         """停止守护进程"""
+        if not self.running:
+            return
+            
         print("正在停止键盘守护进程...")
         self.running = False
+        
+        # 关闭键盘设备
+        self.close_keyboard_devices()
         
         # 关闭控制Socket
         try:
@@ -507,7 +484,8 @@ if __name__ == '__main__':
     
     # 检查命令行参数
     simulate = '--simulate' in sys.argv or '-s' in sys.argv
+    debug = '--debug' in sys.argv or '-d' in sys.argv
     
     config_path = os.path.join(os.path.dirname(__file__), 'config', 'config.ini')
-    daemon = KeyboardEventDaemon(config_path, simulate=simulate)
+    daemon = KeyboardEventDaemon(config_path, simulate=simulate, debug=debug)
     daemon.run()

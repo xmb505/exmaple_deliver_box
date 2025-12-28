@@ -2,12 +2,40 @@
 
 ## 概述
 
-键盘守护进程（daemon_keyboard）提供了一个基于Unix Socket的键盘事件监听接口。该守护进程通过UDP socket以JSON格式广播键盘输入事件。
+键盘守护进程（daemon_keyboard）提供了一个基于Unix Socket的键盘事件监听接口。该守护进程采用事件驱动机制，使用select监听输入设备数据，通过UDP socket以JSON格式广播键盘输入事件。
+
+## 设计特点
+
+- **事件驱动**：使用select系统调用监听输入设备，避免轮询+sleep模式
+- **高性能**：针对MIPS低性能平台优化，减少CPU占用
+- **自动检测**：自动扫描系统中的键盘设备
+- **统一协议**：与daemon_gpio和daemon_ht1621保持一致的JSON通信协议
+- **调试支持**：支持--debug和--simulate参数
 
 ## Socket接口
 
-- **控制Socket**：`/tmp/keyboard.sock`（UDP）- 用于发送控制命令（目前未实现控制功能）
+- **控制Socket**：`/tmp/keyboard.sock`（UDP）- 用于发送控制命令
 - **状态监听Socket**：`/tmp/keyboard_get.sock`（UDP）- 用于接收键盘事件和状态查询
+
+## 启动方式
+
+```bash
+# 生产模式
+cd deamon/daemon_keyboard
+python3 daemon_keyboard.py
+
+# 模拟模式（无硬件测试）
+python3 daemon_keyboard.py --simulate
+
+# 调试模式
+python3 daemon_keyboard.py --debug
+
+# 使用启动脚本
+./start_daemon.sh
+
+# 停止守护进程
+./stop_daemon.sh
+```
 
 ## JSON数据结构
 
@@ -82,6 +110,21 @@
 - `current_keys`：当前所有按键的状态，true表示按下，false表示释放
 - `current_keys_timestamp`：当前处于按下状态的按键的按下时间戳
 
+### 4. ACK确认消息
+
+客户端发送给守护进程，确认已收到消息：
+
+```json
+{
+    "type": "ack",
+    "id": 123
+}
+```
+
+**字段说明**：
+- `type`：消息类型，固定为"ack"
+- `id`：要确认的消息ID
+
 ## 客户端使用方法
 
 ### 1. 监听键盘事件
@@ -113,6 +156,29 @@
 - 笔记本内置键盘
 - 多功能键盘（如带有消费者控制或系统控制功能的键盘）
 
+检测逻辑：扫描`/dev/input/event*`设备，读取设备名称，检查是否包含以下关键词：
+- keyboard
+- key
+- atkbd
+- usb keyboard
+- usbkeyboard
+
+## 配置文件
+
+**文件**: `deamon/daemon_keyboard/config/config.ini`
+
+```ini
+[daemon_config]
+# 控制命令Socket文件位置
+socket_path = /tmp/keyboard.sock
+# 键盘事件监听Socket文件位置
+get_statu_path = /tmp/keyboard_get.sock
+
+[keyboard_config]
+# 键盘设备路径（自动检测，无需手动指定）
+# 程序会自动扫描 /dev/input/event* 设备并识别键盘设备
+```
+
 ## 通信协议
 
 1. 客户端首先向`/tmp/keyboard_get.sock`发送一次查询请求
@@ -120,4 +186,110 @@
 3. 守护进程将所有键盘事件广播到所有已记录的客户端地址
 4. 客户端从其发送请求的同一socket接收事件
 
-这种设计解决了TCP缓冲区问题，确保事件的实时传递。
+这种设计实现了真正的广播机制，确保事件的实时传递。
+
+## 技术细节
+
+### Input Events结构体
+
+Linux Input Events使用以下结构体（24字节）：
+```c
+struct input_event {
+    struct timeval time;  // 16 bytes (tv_sec + tv_usec)
+    unsigned short type;  // 2 bytes (事件类型)
+    unsigned short code;  // 2 bytes (事件代码)
+    unsigned int value;   // 4 bytes (事件值)
+};
+```
+
+### 事件类型
+
+- `EV_KEY (1)`：键盘事件
+  - `value = 1`：按键按下
+  - `value = 0`：按键释放
+  - `value = 2`：按键重复（长按）
+
+### 事件驱动机制
+
+- 使用`select`系统调用监听输入设备文件描述符
+- 超时时间设置为0.1秒，避免阻塞
+- 当有数据可读时，一次性读取所有可用数据
+- 避免轮询+sleep模式，减少CPU占用
+
+### 性能优化
+
+- 非阻塞IO：设置设备文件为非阻塞模式
+- 批量读取：一次性读取所有可用数据
+- 状态缓存：维护当前按键状态字典
+- 客户端管理：自动清理断开的客户端
+
+## 与其他守护进程的一致性
+
+daemon_keyboard遵循与daemon_gpio和daemon_ht1621相同的设计原则：
+
+1. **配置驱动**：使用config.ini进行配置
+2. **事件驱动**：使用select监听IO事件
+3. **线程分离**：主线程处理控制命令，子线程处理硬件操作
+4. **JSON协议**：统一的JSON通信格式
+5. **调试支持**：支持--debug和--simulate参数
+6. **资源清理**：完善的stop()方法清理socket和设备资源
+7. **启动脚本**：提供start_daemon.sh和stop_daemon.sh
+
+## 故障排除
+
+### 1. Socket连接失败
+
+```bash
+# 检查Socket文件是否存在
+ls -la /tmp/keyboard.sock /tmp/keyboard_get.sock
+
+# 重新启动守护进程
+./stop_daemon.sh
+./start_daemon.sh
+```
+
+### 2. 键盘设备未检测到
+
+```bash
+# 检查输入设备
+ls -la /dev/input/event*
+
+# 查看设备信息
+cat /sys/class/input/event*/device/name
+```
+
+### 3. 权限问题
+
+```bash
+# 添加用户到input组
+sudo usermod -a -G input $USER
+
+# 或修改设备权限
+sudo chmod 666 /dev/input/event*
+```
+
+### 4. 查看日志
+
+```bash
+# 实时查看日志
+tail -f keyboard_daemon.log
+
+# 查看错误信息
+grep -i error keyboard_daemon.log
+```
+
+## 版本历史
+
+### v2.0 (当前版本)
+- 重构代码，使其与daemon_gpio和daemon_ht1621保持一致的设计风格
+- 优化事件驱动机制，使用select监听输入设备数据
+- 添加调试模式支持（--debug参数）
+- 添加启动和停止脚本
+- 优化JSON协议，使其更规范
+- 添加设备自动重连机制
+- 改进资源清理逻辑
+
+### v1.0
+- 初始版本
+- 实现基本的键盘事件监听
+- 实现Unix Socket进程间通信

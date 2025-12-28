@@ -16,7 +16,7 @@ import configparser
 class HT1621Daemon:
     """HT1621守护进程类"""
     
-    def __init__(self, config_path="/home/xmb505/智能外卖柜样机/deamon/daemon_ht1621/config/config.ini", debug=False):
+    def __init__(self, config_path="/home/xmb505/智能外卖柜样机/deamon/daemon_ht1621/config/config.ini", debug=False, debug_in=False):
         # 创建一个区分大小写的配置解析器
         self.config = configparser.ConfigParser()
         # 设置选项名称保持原样（区分大小写）
@@ -27,6 +27,7 @@ class HT1621Daemon:
         self.ht1621_socket_path = self.config.get('daemon_config', 'ht1621_socket_path', fallback='/tmp/ht1621.sock')
         self.running = True
         self.debug = debug  # 添加调试标志
+        self.debug_in = debug_in  # 添加传入参数调试标志
         
         # 从配置文件读取段码表 (从font_data段)
         self.digit_to_segments = {}
@@ -147,7 +148,77 @@ class HT1621Daemon:
             "spi_data": command
         }
         
+        # 如果启用了debug_in，则打印SPI数据
+        if self.debug_in:
+            print(f"调试输入: 发送SPI数据 - 设备ID: {device_id}, 地址: {address}, 数据: {data}, 命令: {command}")
+        
         return self.send_to_gpio(json.dumps(cmd))
+    
+    def send_command_to_ht1621(self, device_id, command_9bit):
+        """发送9位命令到HT1621
+        
+        Args:
+            device_id: 设备ID
+            command_9bit: 9位命令 (如 "000000000")
+        """
+        if device_id not in self.device_mapping:
+            print(f"错误: 未找到device_id {device_id}的映射配置")
+            return False
+            
+        alias, spi_interface_id = self.device_mapping[device_id]
+        
+        # 命令格式: 100 + 9位命令
+        full_command = f"100{command_9bit}"
+        
+        cmd = {
+            "alias": alias,
+            "mode": "spi",
+            "spi_num": spi_interface_id,
+            "spi_data_cs_collection": "down",
+            "spi_data": full_command
+        }
+        
+        # 如果启用了debug_in，则打印命令
+        if self.debug_in:
+            print(f"调试输入: 发送HT1621命令 - 设备ID: {device_id}, 9位命令: {command_9bit}, 完整命令: {full_command}")
+        
+        return self.send_to_gpio(json.dumps(cmd))
+    
+    def lcd_display_on(self, device_id):
+        """打开LCD显示输出
+        
+        Args:
+            device_id: 设备ID
+        """
+        # LCDON命令: 100 000000110 (打开显示输出)
+        return self.send_command_to_ht1621(device_id, "000000110")
+    
+    def lcd_display_off(self, device_id):
+        """关闭LCD显示输出
+        
+        Args:
+            device_id: 设备ID
+        """
+        # LCDOF命令: 100 000000100 (关闭显示输出)
+        return self.send_command_to_ht1621(device_id, "000000100")
+    
+    def lcd_sys_on(self, device_id):
+        """使能HT1621系统
+        
+        Args:
+            device_id: 设备ID
+        """
+        # SYSEN命令: 100 000000010 (使能系统)
+        return self.send_command_to_ht1621(device_id, "000000010")
+    
+    def lcd_sys_off(self, device_id):
+        """关闭HT1621系统
+        
+        Args:
+            device_id: 设备ID
+        """
+        # SYSDIS命令: 100 000000000 (关闭系统)
+        return self.send_command_to_ht1621(device_id, "000000000")
     
     def display_data(self, device_id, display_data):
         """在HT1621上显示数据"""
@@ -160,6 +231,10 @@ class HT1621Daemon:
         
         # 将显示数据右对齐，左边填充空格
         padded_data = display_data.rjust(6)
+        
+        # 如果启用了debug_in，则打印显示数据处理过程
+        if self.debug_in:
+            print(f"调试输入: 显示数据处理 - 设备ID: {device_id}, 原始数据: {display_data}, 填充后: {padded_data}")
         
         # 写入每个字符到对应的RAM地址
         # 修复显示方向问题：字符顺序需要反向映射到RAM地址
@@ -179,11 +254,21 @@ class HT1621Daemon:
                 # 反向映射：将第一个字符映射到最后一个RAM地址，最后一个字符映射到第一个RAM地址
                 ram_address_index = len(self.ram_addresses) - 1 - i
                 ram_address = self.ram_addresses[ram_address_index] if ram_address_index >= 0 else self.ram_addresses[0]
+                
+                # 如果启用了debug_in，则打印字符处理过程
+                if self.debug_in:
+                    print(f"调试输入: 处理字符 - 位置: {i}, 字符: '{char}', RAM地址: {ram_address}, 段码: {segment_data}")
+                
                 self.write_ram_to_ht1621(device_id, ram_address, segment_data)
             else:
                 # 如果字符不在段码表中，显示为空白
                 ram_address_index = len(self.ram_addresses) - 1 - i
                 ram_address = self.ram_addresses[ram_address_index] if ram_address_index >= 0 else self.ram_addresses[0]
+                
+                # 如果启用了debug_in，则打印未知字符处理过程
+                if self.debug_in:
+                    print(f"调试输入: 未知字符 - 位置: {i}, 字符: '{char}', RAM地址: {ram_address}, 段码: 空白")
+                
                 self.write_ram_to_ht1621(device_id, ram_address, self.digit_to_segments.get('space', '00000000'))
         
         return True
@@ -194,22 +279,76 @@ class HT1621Daemon:
             command = json.loads(data.decode('utf-8'))
             
             device_id = command.get('device_id', 1)
+            command_type = command.get('command', '')
             display_data = command.get('display_data', '')
             
-            if display_data == 'init':
-                # 特殊命令：初始化HT1621
-                success = self.init_ht1621(device_id)
-                if success:
-                    return {'status': 'success', 'message': f'HT1621设备 {device_id} 初始化完成'}
+            # 如果启用了debug_in，则打印所有传入参数
+            if self.debug_in:
+                print(f"调试输入: 接收到命令 - device_id: {device_id}, command: {command_type}, display_data: {display_data}")
+            
+            # 优先使用command字段，如果command字段为空则使用旧格式
+            if command_type:
+                # 新格式：使用command字段
+                if command_type == 'init':
+                    # 初始化HT1621
+                    success = self.init_ht1621(device_id)
+                    if success:
+                        return {'status': 'success', 'message': f'HT1621设备 {device_id} 初始化完成'}
+                    else:
+                        return {'status': 'error', 'message': f'HT1621设备 {device_id} 初始化失败'}
+                elif command_type == 'display_data':
+                    # 显示数据
+                    success = self.display_data(device_id, display_data)
+                    if success:
+                        return {'status': 'success', 'message': f'已显示: {display_data}'}
+                    else:
+                        return {'status': 'error', 'message': f'显示数据失败: {display_data}'}
+                elif command_type == 'LCD_display_on':
+                    # 打开LCD显示
+                    success = self.lcd_display_on(device_id)
+                    if success:
+                        return {'status': 'success', 'message': f'HT1621设备 {device_id} 显示已开启'}
+                    else:
+                        return {'status': 'error', 'message': f'HT1621设备 {device_id} 显示开启失败'}
+                elif command_type == 'LCD_display_off':
+                    # 关闭LCD显示
+                    success = self.lcd_display_off(device_id)
+                    if success:
+                        return {'status': 'success', 'message': f'HT1621设备 {device_id} 显示已关闭'}
+                    else:
+                        return {'status': 'error', 'message': f'HT1621设备 {device_id} 显示关闭失败'}
+                elif command_type == 'LCD_sys_on':
+                    # 开启系统
+                    success = self.lcd_sys_on(device_id)
+                    if success:
+                        return {'status': 'success', 'message': f'HT1621设备 {device_id} 系统已开启'}
+                    else:
+                        return {'status': 'error', 'message': f'HT1621设备 {device_id} 系统开启失败'}
+                elif command_type == 'LCD_sys_off':
+                    # 关闭系统
+                    success = self.lcd_sys_off(device_id)
+                    if success:
+                        return {'status': 'success', 'message': f'HT1621设备 {device_id} 系统已关闭'}
+                    else:
+                        return {'status': 'error', 'message': f'HT1621设备 {device_id} 系统关闭失败'}
                 else:
-                    return {'status': 'error', 'message': f'HT1621设备 {device_id} 初始化失败'}
+                    return {'status': 'error', 'message': f'未知命令: {command_type}'}
             else:
-                # 显示数据
-                success = self.display_data(device_id, display_data)
-                if success:
-                    return {'status': 'success', 'message': f'已显示: {display_data}'}
+                # 旧格式兼容：如果command字段为空，使用旧的display_data判断
+                if display_data == 'init':
+                    # 特殊命令：初始化HT1621
+                    success = self.init_ht1621(device_id)
+                    if success:
+                        return {'status': 'success', 'message': f'HT1621设备 {device_id} 初始化完成'}
+                    else:
+                        return {'status': 'error', 'message': f'HT1621设备 {device_id} 初始化失败'}
                 else:
-                    return {'status': 'error', 'message': f'显示数据失败: {display_data}'}
+                    # 显示数据
+                    success = self.display_data(device_id, display_data)
+                    if success:
+                        return {'status': 'success', 'message': f'已显示: {display_data}'}
+                    else:
+                        return {'status': 'error', 'message': f'显示数据失败: {display_data}'}
                 
         except json.JSONDecodeError:
             return {'status': 'error', 'message': 'JSON格式错误'}
@@ -290,8 +429,9 @@ def main():
     import sys
     # 检查命令行参数
     debug = '--debug' in sys.argv or '-d' in sys.argv
+    debug_in = '--debug-in' in sys.argv or '-di' in sys.argv
     
-    daemon = HT1621Daemon(debug=debug)
+    daemon = HT1621Daemon(debug=debug, debug_in=debug_in)
     try:
         daemon.start_server()
     except KeyboardInterrupt:

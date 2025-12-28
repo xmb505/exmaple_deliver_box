@@ -5,6 +5,7 @@ keyboard_read.py - 键盘事件监听工具
 
 用法:
     ./keyboard_read.py --socket_path /tmp/keyboard_get.sock
+    ./keyboard_read.py --socket_path /tmp/keyboard_get.sock --query-interval 30  # 每30秒查询一次当前状态
 """
 
 import argparse
@@ -17,39 +18,40 @@ import threading
 import time
 
 
-def send_ack(sock, message_id):
+def send_ack(sock, message_id, addr):
     """向服务器发送ACK确认"""
     ack_msg = {
         "type": "ack",
         "id": message_id
     }
     try:
-        sock.send(json.dumps(ack_msg).encode('utf-8'))
+        sock.sendto(json.dumps(ack_msg).encode('utf-8'), addr)
         return True
     except Exception as e:
         print(f"发送ACK失败: {e}")
         return False
 
 
-def send_status_query(sock):
+def send_status_query(sock, addr):
     """向服务器发送状态查询请求"""
     query_msg = {
         "type": "query_status"
     }
     try:
-        sock.send(json.dumps(query_msg).encode('utf-8'))
+        sock.sendto(json.dumps(query_msg).encode('utf-8'), addr)
         return True
     except Exception as e:
         print(f"发送状态查询失败: {e}")
         return False
 
 
-def listen_keyboard_events(socket_path):
+def listen_keyboard_events(socket_path, query_interval=None):
     """
     连接到键盘事件监听Socket并持续监听事件
     
     Args:
         socket_path (str): 键盘事件监听Socket路径
+        query_interval (int): 状态查询间隔（秒），None表示不主动查询
     """
     # 检查socket文件是否存在
     if not os.path.exists(socket_path):
@@ -68,16 +70,37 @@ def listen_keyboard_events(socket_path):
     try:
         print(f"正在连接到键盘事件监听Socket: {socket_path}")
         
-        # 发送状态查询请求以获取当前键盘状态
-        print("发送状态查询请求...")
-        query_msg = {
-            "type": "query_status"
-        }
-        sock.sendto(json.dumps(query_msg).encode('utf-8'), socket_path)
+        # 连接成功后立即查询一次当前键盘状态，模拟开机时获取初始状态
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 正在获取初始键盘状态（模拟开机状态）...")
+        if send_status_query(sock, socket_path):
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 已发送初始状态查询请求")
+            # 等待一小段时间接收响应
+            time.sleep(0.5)
+        else:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 初始状态查询请求发送失败")
         
         print("成功设置键盘事件监听，开始监听事件...")
         print("按Ctrl+C退出监听")
+        if query_interval:
+            print(f"将每 {query_interval} 秒查询一次当前键盘状态")
         print("-" * 50)
+        
+        # 启动定期查询线程（如果指定了查询间隔）
+        query_thread = None
+        if query_interval:
+            def query_loop():
+                while True:
+                    try:
+                        time.sleep(query_interval)
+                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 发送状态查询请求...")
+                        if not send_status_query(sock, socket_path):
+                            print("状态查询发送失败")
+                    except:
+                        # 查询线程异常退出
+                        break
+            
+            query_thread = threading.Thread(target=query_loop, daemon=True)
+            query_thread.start()
         
         while True:
             try:
@@ -112,26 +135,40 @@ def listen_keyboard_events(socket_path):
                                             complete_json = json_str[obj_start:i+1]
                                             json_data = json.loads(complete_json)
                                             
-                                            # 格式化输出键盘事件
-                                            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # 包含毫秒
-                                            event_type = json_data.get('event_type', 'unknown')
-                                            key = json_data.get('key', 'unknown')
+                                            # 检查是否包含消息ID，如果包含则发送ACK
+                                            if 'id' in json_data:
+                                                message_id = json_data['id']
+                                                send_ack(sock, message_id, addr)
+                                                if query_interval:  # 只在定期查询模式下打印ACK
+                                                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 已发送ACK: {message_id}")
                                             
-                                            # 根据事件类型处理
+                                            # 格式化输出键盘事件
+                                            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                            
+                                            # 根据消息类型处理
                                             if json_data.get('type') == 'current_status':
                                                 # 输出当前键盘状态
                                                 current_keys = json_data.get('current_keys', {})
                                                 print(f"[{timestamp}] 当前键盘状态: {current_keys}")
-                                            elif event_type == 'press':
-                                                key_code = json_data.get('key_code', 'N/A')
-                                                device = json_data.get('device', 'N/A')
-                                                print(f"[{timestamp}] 按键按下: {key} (码: {key_code}, 设备: {device})")
-                                            elif event_type == 'release':
-                                                key_code = json_data.get('key_code', 'N/A')
-                                                device = json_data.get('device', 'N/A')
-                                                print(f"[{timestamp}] 按键释放: {key} (码: {key_code}, 设备: {device})")
+                                            elif json_data.get('type') == 'key_event':
+                                                event_type = json_data.get('event_type', 'unknown')
+                                                key = json_data.get('key', 'unknown')
+                                                
+                                                if event_type == 'press':
+                                                    key_code = json_data.get('key_code', 'N/A')
+                                                    device = json_data.get('device', 'N/A')
+                                                    print(f"[{timestamp}] 按键按下: {key} (码: {key_code}, 设备: {device})")
+                                                elif event_type == 'release':
+                                                    key_code = json_data.get('key_code', 'N/A')
+                                                    device = json_data.get('device', 'N/A')
+                                                    print(f"[{timestamp}] 按键释放: {key} (码: {key_code}, 设备: {device})")
+                                                elif event_type == 'repeat':
+                                                    # 忽略重复事件（长按），避免刷屏
+                                                    pass
+                                                else:
+                                                    print(f"[{timestamp}] 键盘事件: {json.dumps(json_data, ensure_ascii=False)}")
                                             else:
-                                                print(f"[{timestamp}] 键盘事件: {json.dumps(json_data, ensure_ascii=False)}")
+                                                print(f"[{timestamp}] 键盘消息: {json.dumps(json_data, ensure_ascii=False)}")
                                                 
                                             parsed_count += 1
                                         except json.JSONDecodeError:
@@ -187,10 +224,12 @@ def main():
     parser = argparse.ArgumentParser(description="键盘事件监听工具")
     parser.add_argument("--socket_path", "-s", required=True, 
                         help="键盘事件监听Socket路径 (例如: /tmp/keyboard_get.sock)")
+    parser.add_argument("--query-interval", "-q", type=int, 
+                        help="状态查询间隔（秒），用于主动查询当前键盘状态")
     
     args = parser.parse_args()
     
-    listen_keyboard_events(args.socket_path)
+    listen_keyboard_events(args.socket_path, args.query_interval)
 
 
 if __name__ == '__main__':

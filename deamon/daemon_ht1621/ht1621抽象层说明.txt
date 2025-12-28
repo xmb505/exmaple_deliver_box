@@ -1,18 +1,147 @@
-这个程序负责将控制HT1621的二进制翻译成UNIX Socket，我不想再写底层了
-这个程序会放一个ht1621.sock给外部程序访问
-然后连接gpio.sock，使用spi模式操作HT1621
+# HT1621抽象层说明
 
-JSON控制语句
+## 概述
+这个程序负责将控制HT1621的二进制翻译成UNIX Socket，我不想再写底层了。
+这个程序会放一个ht1621.sock给外部程序访问，然后连接gpio.sock，使用spi模式操作HT1621。
 
+## Socket接口
+- Socket类型：UDP
+- 默认路径：/tmp/ht1621.sock
+
+## JSON命令格式（新格式 - 推荐）
+
+### 显示数据命令
+```json
+{
+    "device_id": 1,
+    "command": "display_data",
+    "display_data": "123456"
+}
+```
+
+### 初始化命令
+```json
+{
+    "device_id": 1,
+    "command": "init"
+}
+```
+
+### LCD显示控制命令
+```json
+{
+    "device_id": 1,
+    "command": "LCD_display_on"
+}
+```
+
+```json
+{
+    "device_id": 1,
+    "command": "LCD_display_off"
+}
+```
+
+### 系统控制命令
+```json
+{
+    "device_id": 1,
+    "command": "LCD_sys_on"
+}
+```
+
+```json
+{
+    "device_id": 1,
+    "command": "LCD_sys_off"
+}
+```
+
+### 参数说明
+- `device_id`: 设备ID (1-5，对应配置文件中的映射)
+- `command`: 命令类型
+  - `"display_data"`: 显示数据，需配合 `display_data` 参数
+  - `"init"`: 初始化HT1621
+  - `"LCD_display_on"`: 打开LCD显示
+  - `"LCD_display_off"`: 关闭LCD显示
+  - `"LCD_sys_on"`: 使能HT1621系统
+  - `"LCD_sys_off"`: 关闭HT1621系统
+- `display_data`: 要显示的字符串 (最多6位，仅在 `command` 为 `"display_data"` 时需要)
+
+## JSON命令格式（旧格式 - 兼容）
+
+为了向后兼容，旧格式仍然支持：
+
+### 显示数据命令
+```json
 {
     "device_id": 1,
     "display_data": "123456"
 }
+```
 
-当然：
+### 初始化命令
+```json
 {
-    "device_id": 2,
-    "display_data": "Err404",
+    "device_id": 1,
+    "display_data": "init"
 }
+```
 
-这里的device_id对应配置文件里面的device_spi_io = [0-5]
+**注意**: 旧格式中，当 `display_data` 为 `"init"` 时执行初始化，其他值执行显示操作。
+
+### device_id映射
+这里的device_id对应配置文件里面的设备映射：
+```ini
+[device_mapping]
+device_1 = spi:1    # 外卖员侧LCD
+device_2 = spi:2    # 学生侧LCD
+device_3 = spi:3    # 预留
+device_4 = spi:4    # 预留
+device_5 = spi:5    # 预留
+```
+
+## 使用示例
+
+### 1. 初始化LCD
+```json
+{"device_id": 1, "command": "init"}
+```
+
+### 2. 显示数字
+```json
+{"device_id": 1, "command": "display_data", "display_data": "123456"}
+```
+
+### 3. 显示错误信息
+```json
+{"device_id": 2, "command": "display_data", "display_data": "Err404"}
+```
+
+### 4. 清空显示
+```json
+{"device_id": 1, "command": "display_data", "display_data": "      "}
+```
+
+### 5. LCD显示控制
+```json
+{"device_id": 1, "command": "LCD_display_on"}
+{"device_id": 1, "command": "LCD_display_off"}
+```
+
+### 6. 系统控制
+```json
+{"device_id": 1, "command": "LCD_sys_on"}
+{"device_id": 1, "command": "LCD_sys_off"}
+```
+
+## 调试模式
+启动时可以添加参数：
+- `--debug-in`: 打印所有传入参数和处理过程
+- `--debug`: 完整调试模式
+
+## 内部工作流程
+1. 接收JSON命令
+2. 解析command类型
+3. 根据command类型执行相应操作（初始化、显示、显示开关等）
+4. 通过GPIO守护进程的SPI模式发送到硬件
