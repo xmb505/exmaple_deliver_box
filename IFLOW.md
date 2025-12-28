@@ -21,7 +21,7 @@
 
 ### 系统架构图
 ```
-应用层 (开发中)
+应用层
     ↓
 Unix Socket接口层
     ↓
@@ -67,18 +67,32 @@ Unix Socket接口层
 - 监听键盘输入事件并广播
 - 支持键盘按键状态查询
 - 使用Unix Socket进行进程间通信
+- 支持主键盘和小键盘输入
+- 实时显示当前所有按键状态（支持组合键）
 
 #### 4. daemon_all - 总守护进程
-**位置**: `deamon/daemon_all/`
-**功能**: 负责启动和管理其他守护进程
+**位置**: `deamon/daemon_all/daemon_all.py`
+
+**功能**:
+- 负责启动和管理所有守护进程和应用层
+- 按顺序启动服务：gpio_service → daemon_ht1621 → daemon_keyboard → application
+- 监控服务状态，服务异常退出时自动重启
+- 支持debug模式，输出application日志到控制台
+
+**配置文件**: `deamon/daemon_all/config/config.ini`
 
 #### 5. application - 应用层
 **位置**: `application/`
-**状态**: 开发中
+**状态**: 已完成
 
 **目录结构**:
-- `config/`: 应用层配置文件
-- `doc/`: 应用层文档，包括GPIO映射表等
+- `config/`: 配置文件
+- `communication/`: Socket通信模块
+- `hardware/`: 硬件控制器（GPIO、LCD、嗡鸣器、门锁）
+- `input/`: 输入处理（键盘处理器）
+- `pickup_code/`: 验证码生成和验证
+- `state_machine/`: 状态机实现
+- `log_system/`: 日志系统
 
 ## 构建和运行
 
@@ -90,58 +104,77 @@ Unix Socket接口层
 
 ### 启动步骤
 
-#### 1. 启动GPIO守护进程
+#### 方式一：使用总守护进程（推荐）
 ```bash
-cd deamon/daemon_gpio
-# 生产模式
-python3 daemon_gpio.py
+cd deamon/daemon_all
 
-# 模拟模式（无硬件测试）
-python3 daemon_gpio.py --simulate
-
-# SPI调试模式
-python3 daemon_gpio.py --debug-spi
-
-# 调试模式
-python3 daemon_gpio.py --debug
-
-# 使用启动脚本
+# 正常模式启动
 ./start_daemon.sh
 
-# 停止守护进程
+# Debug模式启动（输出application日志到控制台）
+./daemon_all.py --debug-application
+
+# 停止所有服务
 ./stop_daemon.sh
 ```
 
-#### 2. 启动HT1621守护进程
+#### 方式二：手动启动各个守护进程
 ```bash
+# 1. 启动GPIO守护进程
+cd deamon/daemon_gpio
+python3 daemon_gpio.py
+
+# 2. 启动HT1621守护进程
 cd deamon/daemon_ht1621
 python3 daemon_ht1621.py
-```
 
-#### 3. 启动键盘守护进程
-```bash
+# 3. 启动键盘守护进程
 cd deamon/daemon_keyboard
 python3 daemon_keyboard.py
+
+# 4. 启动应用层
+cd application
+python3 main.py
 ```
 
-#### 4. 验证服务状态
+#### 方式三：使用守护进程启动脚本
+```bash
+# GPIO守护进程
+cd deamon/daemon_gpio
+./start_daemon.sh
+./stop_daemon.sh
+
+# HT1621守护进程
+cd deamon/daemon_ht1621
+python3 daemon_ht1621.py
+
+# 键盘守护进程
+cd deamon/daemon_keyboard
+python3 daemon_keyboard.py
+
+# 应用层
+cd application
+./start.sh
+```
+
+### 验证服务状态
 ```bash
 # 检查Socket文件
-ls -la /tmp/gpio.sock /tmp/gpio_get.sock /tmp/ht1621.sock /tmp/keyboard.sock
+ls -la /tmp/gpio.sock /tmp/gpio_get.sock /tmp/ht1621.sock /tmp/keyboard_get.sock
 
 # 检查进程
 ps aux | grep daemon
 ```
 
-### 测试工具
+## 测试工具
 
-#### 1. 通用Socket发送工具
+### 1. 通用Socket发送工具
 ```bash
 cd debug_utils
 python3 socket_json_sender.py --socket-path /tmp/gpio.sock --data '{"alias": "sender", "mode": "set", "gpio": 1, "value": 1}'
 ```
 
-#### 2. HT1621显示测试
+### 2. HT1621显示测试
 ```bash
 cd deamon/daemon_ht1621
 # 显示数字
@@ -151,7 +184,7 @@ python3 ht1621_test.py 123456
 python3 ht1621_test.py init
 ```
 
-#### 3. GPIO状态监听工具
+### 3. GPIO状态监听工具
 ```bash
 cd debug_utils
 # 基本监听（启动时会自动获取初始GPIO状态）
@@ -163,13 +196,13 @@ python3 gpio_read.py --socket_path /tmp/gpio_get.sock --query-interval 30
 
 **重要说明**：gpio_read.py 在启动时会自动发送一次状态查询请求，获取所有GPIO的初始状态。这模拟了系统开机时需要知道柜内是否有物品的场景，确保应用层能够获取到初始的GPIO状态。这对于实现开机状态同步非常重要。
 
-#### 4. 键盘输入监听工具
+### 4. 键盘输入监听工具
 ```bash
 cd debug_utils
-python3 keyboard_read.py
+python3 keyboard_read.py --socket_path /tmp/keyboard_get.sock
 ```
 
-#### 5. 自动化测试脚本
+### 5. 自动化测试脚本
 ```bash
 cd debug_utils
 ./HT1621UNIXSOCKET_test.sh
@@ -187,7 +220,7 @@ cd debug_utils
 ### 通信协议
 - 所有进程间通信使用Unix Socket
 - 数据格式统一为JSON
-- 控制命令使用UDP Socket（SOCK_DGRAM），状态监听使用TCP Socket（SOCK_STREAM）
+- 控制命令使用UDP Socket（SOCK_DGRAM），状态监听使用UDP Socket（SOCK_DGRAM）
 - 使用select进行IO多路复用，实现真正的异步监听
 
 ### GPIO控制协议
@@ -300,10 +333,43 @@ cd debug_utils
 // 键盘按键事件（服务器发送）
 {
     "type": "key_event",
-    "timestamp": 1234567890.123456,
-    "key_code": 28,
-    "key_name": "ENTER",
-    "event_type": "press"
+    "id": 123,
+    "timestamp": 1766902627.123456,
+    "current_keys": {
+        "a": true,
+        "b": false,
+        "ENTER": false
+    },
+    "event_type": "press",
+    "key": "a",
+    "key_code": 30,
+    "device": "/dev/input/event0"
+}
+
+// 状态查询请求（客户端发送）
+{
+    "type": "query_status"
+}
+
+// 当前键盘状态响应（服务器发送）
+{
+    "type": "current_status",
+    "id": 124,
+    "timestamp": 1766902628.141522,
+    "current_keys": {
+        "a": false,
+        "b": false,
+        "ENTER": false
+    },
+    "current_keys_timestamp": {
+        "ENTER": 1766902628.000123
+    }
+}
+
+// ACK确认（客户端发送）
+{
+    "type": "ack",
+    "id": 124
 }
 ```
 
@@ -373,6 +439,44 @@ get_statu_path = /tmp/keyboard_get.sock
 # 键盘设备自动检测，无需手动配置
 ```
 
+### 总守护进程配置
+**文件**: `deamon/daemon_all/config/config.ini`
+
+```ini
+[daemon_config]
+listen_gpio_alias = geter
+listen_gpio_num = 16
+listen_ok_timeout = 10
+
+[gpio_service]
+work_dir = ../daemon_gpio
+work_command = ./daemon_gpio.py
+
+[service_ht1621]
+service_name = daemon_ht1621
+name = "HT1621守护进程"
+service_type = daemon
+discription =  "把HT1621的LCD显示逻辑抽象出来"
+work_dir = ../daemon_ht1621
+work_command = ./daemon_ht1621.py
+
+[service_keyboard]
+service_name = daemon_keyboard
+name = "键盘监听守护进程"
+service_type = daemon
+discription =  "把键盘监听抽象成一个Unix Socket接口，所有连接到这个socket文件的进程都会被广播接收键盘输入事件"
+work_dir = ../daemon_keyboard
+work_command = ./daemon_keyboard.py
+
+[service_application]
+service_name = application
+name = "应用层服务"
+service_type = application
+discription =  "智能外卖柜应用层，处理业务逻辑、状态机、验证码生成和验证等"
+work_dir = ../../application
+work_command = python3 main.py
+```
+
 ## 调试功能
 
 ### 模拟模式
@@ -387,13 +491,19 @@ python3 daemon_gpio.py --debug-spi
 python3 daemon_gpio.py --debug
 ```
 
+### Debug模式
+```bash
+# 总守护进程Debug模式（输出application日志到控制台）
+./daemon_all.py --debug-application
+```
+
 ### 日志查看
 ```bash
-# 实时查看日志
-tail -f gpio_daemon.log
+# 查看application日志
+tail -f /var/log/delivery_box.log
 
-# 查看错误信息
-grep -i error gpio_daemon.log
+# 查看守护进程日志
+tail -f /var/log/daemon_all.log
 ```
 
 ## 技术细节
@@ -424,6 +534,8 @@ grep -i error gpio_daemon.log
 - 自动检测键盘设备（扫描 /dev/input/event*）
 - 监听按键按下和释放事件
 - 支持多键盘设备
+- 支持主键盘和小键盘输入
+- 实时显示当前所有按键状态（支持组合键）
 
 ### 性能优化
 - GPIO状态缓存：避免重复设置相同状态
@@ -437,7 +549,7 @@ grep -i error gpio_daemon.log
 ### 已完成
 - ✅ GPIO抽象层：完全实现，支持seter/geter/spi三种模式
 - ✅ HT1621显示层：完全实现，支持多设备映射
-- ✅ 键盘输入层：完全实现，自动检测键盘设备
+- ✅ 键盘输入层：完全实现，自动检测键盘设备，支持小键盘
 - ✅ SPI通信：bit-banging实现，支持多路SPI
 - ✅ 进程间通信：Unix Socket + JSON
 - ✅ 配置管理：模块化配置文件
@@ -445,13 +557,17 @@ grep -i error gpio_daemon.log
 - ✅ 事件驱动机制：使用select实现真正的异步监听
 - ✅ 性能优化：针对MIPS平台优化，减少CPU占用
 - ✅ 初始状态查询：gpio_read.py启动时自动获取GPIO初始状态
+- ✅ 应用层：完全实现，包括状态机、验证码生成和验证
+- ✅ 总守护进程：完全实现，支持自动启动和管理所有服务
+- ✅ 小键盘支持：支持小键盘数字键、回车键、删除键
+- ✅ LCD实时显示：学生侧LCD实时显示输入的验证码
+- ✅ 背光控制：外卖员侧和学生侧LCD背光自动控制
+- ✅ 取物逻辑完善：等待门稳定关闭后检测物品，有物品时重新开门并启动嗡鸣器
 
 ### 待实现
-- 🔄 应用层：业务逻辑和用户界面（开发中）
 - ❌ 错误处理：异常恢复机制
 - ❌ 日志系统：结构化日志记录
 - ❌ 监控功能：系统状态监控
-- ❌ 总守护进程：daemon_all的完整实现
 
 ## 故障排除
 
@@ -463,6 +579,7 @@ grep -i error gpio_daemon.log
 ls -la /tmp/gpio.sock /tmp/ht1621.sock /tmp/keyboard.sock
 
 # 重新启动守护进程
+cd deamon/daemon_all
 ./stop_daemon.sh
 ./start_daemon.sh
 ```
@@ -500,6 +617,23 @@ cat /sys/class/input/event*/device/name
 - 检查守护进程是否正确响应query_status请求
 - 查看gpio_read.py的输出日志
 
+#### 7. application启动失败
+```bash
+# 检查守护进程是否启动
+ps aux | grep daemon
+
+# 检查Socket文件是否存在
+ls -la /tmp/*.sock
+
+# 查看application日志
+tail -f /var/log/delivery_box.log
+```
+
+#### 8. 学生侧LCD不显示数字
+- 确认守护进程已启动
+- 检查键盘输入是否正常
+- 查看application日志，确认LCD初始化是否成功
+
 ## 扩展开发
 
 ### 添加新的守护进程
@@ -531,7 +665,18 @@ cat /sys/class/input/event*/device/name
 
 ## 版本历史
 
-### v1.2 (当前版本)
+### v1.3 (当前版本)
+- 完成应用层开发，实现完整的业务逻辑
+- 实现总守护进程，支持自动启动和管理所有服务
+- 支持小键盘输入（数字键、回车键、删除键）
+- 实现学生侧LCD实时显示输入验证码
+- 实现LCD背光自动控制
+- 完善取物逻辑：等待门稳定、物品检测、嗡鸣器提示
+- 修复键盘socket连接问题（使用bind而非connect）
+- 修复验证码验证方法错误
+- 移除防重放攻击和有效期限制
+
+### v1.2
 - 新增应用层目录结构
 - gpio_read.py增加初始状态查询功能，模拟开机状态获取
 - 完善项目文档，添加应用层架构说明
