@@ -356,7 +356,8 @@ class GPIOControlDaemon:
                 if mode == 'spi':
                     spi_pins = {}
                     for key, value in self.controller_configs[alias]['config'].items():
-                        if key.startswith(('clk_', 'data_', 'cs_')):
+                        # 读取共享的clk和data，以及所有cs引脚（cs_1到cs_14）
+                        if key in ('clk', 'data') or key.startswith('cs_'):
                             # 去除可能的注释部分（以#开头的内容）
                             clean_value = value.split('#')[0].strip()
                             if clean_value:  # 确保去除注释后还有有效内容
@@ -381,7 +382,8 @@ class GPIOControlDaemon:
                         if mode == 'spi':
                             spi_pins = {}
                             for key, value in self.controller_configs[alias]['config'].items():
-                                if key.startswith(('clk_', 'data_', 'cs_')):
+                                # 读取共享的clk和data，以及所有cs引脚（cs_1到cs_14）
+                                if key in ('clk', 'data') or key.startswith('cs_'):
                                     # 去除可能的注释部分（以#开头的内容）
                                     clean_value = value.split('#')[0].strip()
                                     if clean_value:  # 确保去除注释后还有有效内容
@@ -528,20 +530,27 @@ class GPIOControlDaemon:
                     command = spi_task['command']
                     controller = spi_task['controller']
                     
+                    # 获取共享的时钟和数据线
+                    clk_pin = controller_config['spi_pins'].get('clk')
+                    data_pin = controller_config['spi_pins'].get('data')
+                    
+                    if not clk_pin or not data_pin:
+                        print("错误: 未找到共享的clk或data引脚配置")
+                        continue
+                    
                     if command['mode'] == 'spi':
                         # 单路SPI通信
                         spi_num = command.get('spi_num', 1)
                         spi_data = command.get('spi_data', '')
                         cs_collection = command.get('spi_data_cs_collection', 'down')
                         
-                        clk_pin = controller_config['spi_pins'].get(f'clk_{spi_num}')
-                        data_pin = controller_config['spi_pins'].get(f'data_{spi_num}')
+                        # 根据spi_num获取对应的cs引脚
                         cs_pin = controller_config['spi_pins'].get(f'cs_{spi_num}')
                         
-                        if clk_pin and data_pin and cs_pin:
+                        if cs_pin:
                             controller.set_spi(clk_pin, data_pin, cs_pin, spi_data, cs_collection, lag_time, self.debug_spi)
                         else:
-                            print(f"错误: 未找到SPI接口{spi_num}的引脚配置")
+                            print(f"错误: 未找到SPI接口{spi_num}的片选引脚配置")
                     
                     elif command['mode'] == 'spi_multi':
                         # 多路SPI通信
@@ -551,14 +560,13 @@ class GPIOControlDaemon:
                             spi_data = spi_config.get('spi_data', '')
                             cs_collection = spi_config.get('spi_data_cs_collection', 'down')
                             
-                            clk_pin = controller_config['spi_pins'].get(f'clk_{spi_num}')
-                            data_pin = controller_config['spi_pins'].get(f'data_{spi_num}')
+                            # 根据spi_num获取对应的cs引脚
                             cs_pin = controller_config['spi_pins'].get(f'cs_{spi_num}')
                             
-                            if clk_pin and data_pin and cs_pin:
+                            if cs_pin:
                                 controller.set_spi(clk_pin, data_pin, cs_pin, spi_data, cs_collection, lag_time, self.debug_spi)
                             else:
-                                print(f"错误: 未找到SPI接口{spi_num}的引脚配置")
+                                print(f"错误: 未找到SPI接口{spi_num}的片选引脚配置")
                 
                 # 标记任务完成
                 self.spi_queue.task_done()

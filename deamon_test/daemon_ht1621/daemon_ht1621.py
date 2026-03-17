@@ -427,11 +427,16 @@ class HT1621Daemon:
 
 def main():
     import sys
+    import os
     # 检查命令行参数
     debug = '--debug' in sys.argv or '-d' in sys.argv
     debug_in = '--debug-in' in sys.argv or '-di' in sys.argv
     
-    daemon = HT1621Daemon(debug=debug, debug_in=debug_in)
+    # 根据脚本位置动态生成配置文件路径
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, 'config', 'config.ini')
+    
+    daemon = HT1621Daemon(config_path=config_path, debug=debug, debug_in=debug_in)
     try:
         daemon.start_server()
     except KeyboardInterrupt:
