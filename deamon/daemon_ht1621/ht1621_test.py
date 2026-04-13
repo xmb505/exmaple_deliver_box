@@ -37,7 +37,7 @@ def main():
     
     # 创建命令
     command = {
-        "device_id": 1,
+        "device_id": 4,
         "display_data": display_data
     }
     
