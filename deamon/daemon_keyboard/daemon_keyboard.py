@@ -354,9 +354,28 @@ class KeyboardEventDaemon:
             40: "'", 41: '`', 42: 'LEFT_SHIFT', 43: '\\', 44: 'z', 45: 'x', 46: 'c', 47: 'v', 48: 'b',
             49: 'n', 50: 'm', 51: ',', 52: '.', 53: '/', 54: 'RIGHT_SHIFT', 55: 'PRINT_SCREEN', 56: 'ALT',
             57: 'SPACE', 58: 'CAPS_LOCK', 59: 'F1', 60: 'F2', 61: 'F3', 62: 'F4', 63: 'F5', 64: 'F6',
-            65: 'F7', 66: 'F8', 67: 'F9', 68: 'F10', 69: 'NUM_LOCK', 70: 'SCROLL_LOCK', 71: 'HOME', 72: 'UP',
-            73: 'PAGE_UP', 74: 'MINUS', 75: 'LEFT', 76: 'CENTER', 77: 'RIGHT', 78: 'PLUS', 79: 'END',
-            80: 'DOWN', 81: 'PAGE_DOWN', 82: 'INSERT', 83: 'DELETE', 86: '|', 87: 'F11', 88: 'F12'
+            65: 'F7', 66: 'F8', 67: 'F9', 68: 'F10', 69: 'NUM_LOCK', 70: 'SCROLL_LOCK',
+            # 小键盘数字键 - 无论Num Lock状态都映射为数字
+            # 小键盘布局:  7(71)  8(72)  9(73)
+            #             4(75)  5(76)  6(77)
+            #             1(79)  2(80)  3(81)
+            #             0(82)
+            # Num Lock开启时发送KP7-KP9，关闭时发送HOME/UP/PAGE_UP等
+            # 我们都映射为数字，不关心Num Lock状态
+            71: 'KP7', 72: 'KP8', 73: 'KP9',   # 对应 HOME, UP, PAGE_UP
+            74: 'KPMINUS',
+            75: 'KP4', 76: 'KP5', 77: 'KP6',   # 对应 LEFT, CENTER, RIGHT
+            78: 'KPPLUS',
+            79: 'KP1', 80: 'KP2', 81: 'KP3',   # 对应 END, DOWN, PAGE_DOWN
+            82: 'KP0',                         # 对应 INSERT
+            83: 'KPDOT',                       # 对应 DELETE
+            86: '|', 87: 'F11', 88: 'F12',
+            # 小键盘回车 (KEY_KPENTER -> 键码 96)
+            96: 'KPENTER',
+            # 小键盘斜杠 (KEY_KPSLASH -> 键码 98)
+            98: 'KPSLASH',
+            # 小键盘星号 (KEY_KPASTERISK -> 键码 55，与小键盘乘号共用)
+            # 注意：55 已被 PRINT_SCREEN 占用，这里不重复映射
         }
         
         return key_map.get(key_code, f'KEY_{key_code}')

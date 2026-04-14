@@ -1,1 +1,1 @@
-# Hardware package
+# hardware module

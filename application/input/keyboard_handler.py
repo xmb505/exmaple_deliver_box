@@ -1,202 +1,166 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-键盘处理器
-Keyboard Handler
+键盘输入处理 - 通过Unix Socket与daemon_keyboard通信
+处理学生侧小键盘输入
 """
 
-import logging
-import time
-from collections import deque
+import json
+import socket
+import configparser
+import os
+import select
+
 
 class KeyboardHandler:
-    """键盘处理器"""
+    """键盘输入处理器"""
 
-    def __init__(self, socket_client, config, logger, debug_keyboard=False):
-        """
-        初始化键盘处理器
+    def __init__(self, config_path=None):
+        if config_path is None:
+            config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.ini')
 
-        Args:
-            socket_client: SocketClient实例
-            config: ConfigLoader实例
-            logger: Logger实例
-            debug_keyboard: 是否启用键盘调试模式
-        """
-        self.socket_client = socket_client
-        self.config = config
-        self.logger = logger
-        self.debug_keyboard = debug_keyboard
+        self.config = configparser.ConfigParser()
+        self.config.read(config_path)
 
-        # 输入缓冲区
+        # Socket路径
+        self.keyboard_socket = self.config.get('hardware', 'keyboard_socket', fallback='/tmp/keyboard_get.sock')
+
+        # 键盘socket连接
+        self.socket = None
+
+        # 当前输入缓冲
         self.input_buffer = ""
-        self.max_length = config.get_int('pickup_code', 'pickup_code_length', 6)
 
-        # 超时配置
-        self.timeout = config.get_int('keyboard', 'keyboard_input_timeout', 60)
-        self.last_input_time = None
-        self.input_active = False
+        # 最大输入长度
+        self.max_input_length = 6
 
-        # 事件队列
-        self.events = deque()
+        # 回调函数
+        self.on_digit_callback = None
+        self.on_enter_callback = None
+        self.on_delete_callback = None
 
-        # 小键盘key_code到数字的映射
-        self.numpad_key_map = {
-            82: '0',  # KP_0
-            79: '1',  # KP_1
-            80: '2',  # KP_2
-            81: '3',  # KP_3
-            75: '4',  # KP_4
-            76: '5',  # KP_5
-            77: '6',  # KP_6
-            71: '7',  # KP_7
-            72: '8',  # KP_8
-            73: '9',  # KP_9
-        }
-        
-        # 小键盘回车键key_code
-        self.numpad_enter_key = 96  # KP_ENTER
+    def connect(self):
+        """连接键盘socket"""
+        try:
+            # 键盘守护进程使用UDP (SOCK_DGRAM)，不是TCP
+            self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            # 绑定一个本地地址以便接收广播
+            local_addr = f"/tmp/keyboard_client_{os.getpid()}.sock"
+            if os.path.exists(local_addr):
+                os.unlink(local_addr)
+            self.socket.bind(local_addr)
+            self.socket.settimeout(0.1)
 
-        # 支持的按键
-        self.supported_keys = config.get_list('keyboard', 'keyboard_supported_keys', ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
-        self.numpad_keys = config.get('keyboard', 'keyboard_numpad_keys', '82,79,80,81,75,76,77,71,72,73').split(',')
-        self.numpad_keys = [int(k) for k in self.numpad_keys]
+            # 发送query_status消息注册到守护进程，否则不会收到广播
+            try:
+                register_msg = {"type": "query_status"}
+                self.socket.sendto(json.dumps(register_msg).encode(), self.keyboard_socket)
+                print(f"[键盘] 已发送注册消息到 {self.keyboard_socket}")
+            except Exception as e:
+                print(f"[键盘] 发送注册消息失败: {e}")
 
-        # 功能键
-        self.delete_keys = ['BACKSPACE', 'KP_MINUS']
-        self.submit_key = 'ENTER'
-
-        self.logger.info("键盘处理器初始化完成")
-
-    def start(self):
-        """启动键盘监听"""
-        self.logger.info("启动键盘监听...")
-        self.socket_client.start_monitoring()
-
-    def stop(self):
-        """停止键盘监听"""
-        self.logger.info("停止键盘监听...")
-
-    def handle_key_event(self, event):
-        """
-        处理键盘事件
-
-        Args:
-            event: 键盘事件字典
-        """
-        event_type = event.get('event_type')
-        key = event.get('key')
-        key_code = event.get('key_code')
-
-        if self.debug_keyboard:
-            self.logger.info(f"处理键盘事件: type={event_type}, key={key}, code={key_code}")
-
-        if event_type != 'press':
-            if self.debug_keyboard:
-                self.logger.info(f"非按下事件，忽略: {event_type}")
-            return
-
-        # 处理数字键（主键盘或小键盘）
-        digit = None
-        if key in self.supported_keys:
-            digit = key
-        elif key_code in self.numpad_key_map:
-            digit = self.numpad_key_map[key_code]
-        
-        if digit is not None:
-            if len(self.input_buffer) < self.max_length:
-                self.input_buffer += digit
-                self.last_input_time = time.time()
-                self.input_active = True
-                self.logger.debug(f"输入: {self.input_buffer}")
-                
-                if self.debug_keyboard:
-                    self.logger.info(f"数字键输入: {digit} (key={key}, code={key_code}), 当前缓冲区: {self.input_buffer}")
-
-                # 添加输入事件
-                self.events.append({
-                    'type': 'input',
-                    'value': self.input_buffer
-                })
-
-        # 处理删除键
-        elif key in self.delete_keys:
-            if len(self.input_buffer) > 0:
-                self.input_buffer = self.input_buffer[:-1]
-                self.last_input_time = time.time()
-                self.logger.debug(f"删除: {self.input_buffer}")
-                
-                if self.debug_keyboard:
-                    self.logger.info(f"删除键输入，当前缓冲区: {self.input_buffer}")
-
-                # 添加输入事件
-                self.events.append({
-                    'type': 'input',
-                    'value': self.input_buffer
-                })
-
-        # 处理提交键
-        elif key == self.submit_key or key_code == self.numpad_enter_key:
-            if len(self.input_buffer) == self.max_length:
-                code = self.input_buffer
-                self.input_buffer = ""
-                self.input_active = False
-                self.logger.info(f"提交验证码: {code}")
-                
-                if self.debug_keyboard:
-                    self.logger.info(f"提交键输入，验证码: {code}")
-
-                # 添加提交事件
-                self.events.append({
-                    'type': 'submit',
-                    'value': code
-                })
-            else:
-                if self.debug_keyboard:
-                    self.logger.info(f"验证码长度不足，当前长度: {len(self.input_buffer)}, 需要: {self.max_length}")
-
-    def check_timeout(self):
-        """
-        检查输入超时
-
-        Returns:
-            bool: 是否超时
-        """
-        if not self.input_active:
-            return False
-
-        if self.last_input_time is None:
-            return False
-
-        elapsed = time.time() - self.last_input_time
-        if elapsed > self.timeout:
-            self.logger.info(f"输入超时: {elapsed}秒")
-            self.input_buffer = ""
-            self.input_active = False
-            self.last_input_time = None
-
-            # 添加超时事件
-            self.events.append({
-                'type': 'timeout'
-            })
-
+            print("[键盘] 连接成功")
             return True
+        except Exception as e:
+            print(f"[键盘] 连接失败: {e}")
+            return False
 
-        return False
+    def set_callbacks(self, on_digit=None, on_enter=None, on_delete=None):
+        """设置回调函数"""
+        self.on_digit_callback = on_digit
+        self.on_enter_callback = on_enter
+        self.on_delete_callback = on_delete
 
-    def clear_input(self):
-        """清空输入缓冲区"""
+    def process_event(self, timeout=0.1):
+        """处理键盘事件"""
+        if not self.socket:
+            return None
+
+        try:
+            self.socket.settimeout(timeout)
+            # UDP使用recvfrom而不是recv
+            data, addr = self.socket.recvfrom(4096)
+            if data:
+                msg = json.loads(data.decode())
+                print(f"[键盘] 收到事件: {msg}")
+
+                if msg.get('type') == 'key_event':
+                    event_type = msg.get('event_type')
+                    key = msg.get('key')
+
+                    # 只处理按键按下事件
+                    if event_type == 'press':
+                        return self._handle_key(key)
+
+                return msg
+        except socket.timeout:
+            pass
+        except Exception as e:
+            print(f"[键盘] 处理事件出错: {e}")
+        return None
+
+    def _handle_key(self, key):
+        """处理按键"""
+        result = {
+            'key': key,
+            'action': None,
+            'buffer': self.input_buffer
+        }
+
+        # 数字键 (主键盘数字)
+        if key in '0123456789':
+            if len(self.input_buffer) < self.max_input_length:
+                self.input_buffer += key
+                result['action'] = 'digit'
+                result['buffer'] = self.input_buffer
+                print(f"[键盘] 输入: {key}, 当前: {self.input_buffer}")
+                if self.on_digit_callback:
+                    self.on_digit_callback(self.input_buffer)
+            else:
+                print(f"[键盘] 输入已达最大长度")
+
+        # 小键盘数字键 (KP0-KP9)
+        elif key in ('KP0', 'KP1', 'KP2', 'KP3', 'KP4', 'KP5', 'KP6', 'KP7', 'KP8', 'KP9'):
+            digit = key[-1]  # 提取最后一位数字
+            if len(self.input_buffer) < self.max_input_length:
+                self.input_buffer += digit
+                result['action'] = 'digit'
+                result['buffer'] = self.input_buffer
+                print(f"[键盘] 小键盘输入: {digit}, 当前: {self.input_buffer}")
+                if self.on_digit_callback:
+                    self.on_digit_callback(self.input_buffer)
+            else:
+                print(f"[键盘] 输入已达最大长度")
+
+        # 回车键 (主键盘回车和小键盘回车)
+        elif key in ('ENTER', 'KPENTER', '\n'):
+            result['action'] = 'enter'
+            result['buffer'] = self.input_buffer
+            print(f"[键盘] 确认输入: {self.input_buffer}")
+            if self.on_enter_callback:
+                self.on_enter_callback(self.input_buffer)
+
+        # 删除键 (Backspace 和小键盘点/删除键)
+        elif key in ('BACKSPACE', 'DELETE', 'KPDOT'):
+            if self.input_buffer:
+                self.input_buffer = self.input_buffer[:-1]
+                result['action'] = 'delete'
+                result['buffer'] = self.input_buffer
+                print(f"[键盘] 删除, 当前: {self.input_buffer}")
+                if self.on_delete_callback:
+                    self.on_delete_callback(self.input_buffer)
+
+        return result
+
+    def clear_buffer(self):
+        """清空输入缓冲"""
         self.input_buffer = ""
-        self.input_active = False
-        self.last_input_time = None
-        self.logger.debug("清空输入缓冲区")
+        print("[键盘] 输入已清空")
 
-    def get_events(self):
-        """
-        获取所有键盘事件
+    def get_buffer(self):
+        """获取当前输入缓冲"""
+        return self.input_buffer
 
-        Returns:
-            list: 键盘事件列表
-        """
-        events = list(self.events)
-        self.events.clear()
-        return events
+    def close(self):
+        """关闭连接"""
+        if self.socket:
+            self.socket.close()

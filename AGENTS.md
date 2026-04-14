@@ -4,7 +4,7 @@ This file provides guidance to Qoder (qoder.com) when working with code in this 
 
 ## Project Overview
 
-This is a smart delivery locker system based on MT7621 router running immortalwrt (OpenWrt fork). The system implements a dual-door delivery locker with GPIO control, LCD display, keyboard input, and verification code generation.
+Smart delivery locker system for MT7621 router running immortalwrt (OpenWrt fork). Implements dual-door delivery locker with GPIO control, LCD display, keyboard input, and verification code generation.
 
 ## System Architecture
 
@@ -22,13 +22,30 @@ Hardware Abstraction (USB2GPIO, SPI, Input Events)
 Hardware (HT1621 LCD, relays, sensors, keyboard)
 ```
 
-## Key Technologies
+**Data Flow:**
+- Application sends JSON commands to daemon sockets
+- daemon_gpio controls USB2GPIO devices via serial
+- daemon_ht1621 sends SPI commands through daemon_gpio
+- daemon_keyboard broadcasts keyboard events from Linux input subsystem
 
-- **USB2GPIO**: BL-ENV-V1.3 modules via USB-to-serial (/dev/USB2GPIO*)
-- **SPI**: Bit-banging implementation via GPIO (shared clk/data, 14 CS lines)
-- **HT1621**: 6-digit 8-segment LCD driver with custom segment mapping
-- **Communication**: Unix Domain Sockets (SOCK_DGRAM) with JSON protocol
-- **Event-driven**: Uses `select` for I/O multiplexing, no polling loops
+## State Machine
+
+The application uses a state machine (`application/state_machine/delivery_box.py`) with these states:
+
+| State | Description |
+|-------|-------------|
+| `INIT` | Hardware initialization and detection |
+| `WAIT` | Idle state, waiting for store button or pickup input |
+| `RECEIVE` | Delivery person placing item, outer door open |
+| `RECEIVE_CHECK` | Verify item presence after door closes |
+| `PICKUP` | Student retrieving item, inner door open |
+
+**Key Transitions:**
+- `WAIT` → `RECEIVE`: Store button pressed (falling edge detected)
+- `RECEIVE` → `RECEIVE_CHECK`: Outer door closed and stable (3s)
+- `RECEIVE_CHECK` → `WAIT`: Item check complete
+- `WAIT` → `PICKUP`: Valid 6-digit code entered on keyboard
+- `PICKUP` → `WAIT`: Inner door closed, item removed
 
 ## Common Commands
 
@@ -36,36 +53,29 @@ Hardware (HT1621 LCD, relays, sensors, keyboard)
 
 ```bash
 # Start all services (recommended)
-cd deamon/daemon_all
-./start_daemon.sh
+cd deamon/daemon_all && ./start_daemon.sh
 
 # Stop all services
-cd deamon/daemon_all
-./stop_daemon.sh
+cd deamon/daemon_all && ./stop_daemon.sh
 
 # Debug mode (shows application logs in console)
-cd deamon/daemon_all
-./daemon_all.py --debug-application
+cd deamon/daemon_all && ./daemon_all.py --debug-application
 ```
 
-### Manual Service Start
+### Individual Daemon Control
 
 ```bash
-# GPIO daemon
-cd deamon/daemon_gpio
-python3 daemon_gpio.py
+# GPIO daemon (with optional flags)
+cd deamon/daemon_gpio && python3 daemon_gpio.py [--simulate] [--debug-spi] [--debug]
 
 # HT1621 LCD daemon
-cd deamon/daemon_ht1621
-python3 daemon_ht1621.py
+cd deamon/daemon_ht1621 && python3 daemon_ht1621.py
 
 # Keyboard daemon
-cd deamon/daemon_keyboard
-python3 daemon_keyboard.py
+cd deamon/daemon_keyboard && python3 daemon_keyboard.py
 
 # Application layer
-cd application
-python3 main.py
+cd application && python3 main.py
 ```
 
 ### Debug Tools
@@ -76,7 +86,7 @@ cd debug_utils
 # Monitor GPIO state changes
 python3 gpio_read.py --socket_path /tmp/gpio_get.sock
 
-# Query GPIO status periodically
+# Query GPIO status periodically (every 30s)
 python3 gpio_read.py --socket_path /tmp/gpio_get.sock --query-interval 30
 
 # Monitor keyboard input
@@ -87,11 +97,11 @@ python3 socket_json_sender.py --socket-path /tmp/gpio.sock --data '{"alias": "se
 
 # HT1621 display test
 cd deamon/daemon_ht1621
-python3 ht1621_test.py 123456
-python3 ht1621_test.py init
+python3 ht1621_test.py 123456  # Display number
+python3 ht1621_test.py init    # Initialize display
 ```
 
-### Check System Status
+### System Status
 
 ```bash
 # Check socket files
@@ -117,6 +127,14 @@ Key sections:
 - `[GPIO1_sender]`: Output control (/dev/USB2GPIO1, mode=seter)
 - `[GPIO2_spi]`: SPI interface (/dev/USB2GPIO2, mode=spi, 14 CS lines)
 - `[GPIO3_geter]`: Input listener (/dev/USB2GPIO3, mode=geter, default_bit=0/1)
+
+### Application Hardware Mapping
+**File**: `application/config/config.ini`
+
+Maps logical names to GPIO pins:
+- Output pins: LCD backlights (1-4), door relays (5-8)
+- Input pins: Door sensors (1-4), IR sensors (5-6)
+- Store button: GPIO 16
 
 ### HT1621 Configuration
 **File**: `deamon/daemon_ht1621/config/config.ini`
@@ -145,6 +163,7 @@ Key sections:
 ```json
 {"type": "gpio_change", "id": 1, "timestamp": 1234567890.123, "gpios": [{"alias": "geter", "change_gpio": [{"gpio": 1, "bit": 0}]}]}
 {"type": "query_status"}  // Request current status
+{"type": "current_status", "timestamp": 1234567890.123, "gpios": [...]}  // Response
 ```
 
 ### HT1621 Display
@@ -167,6 +186,21 @@ Key sections:
 - `3F`: Single GPIO status query
 - `5A`: PWM output control
 
+## Hardware Abstraction Layer
+
+### GPIOController (`application/hardware/gpio_controller.py`)
+- Connects to `/tmp/gpio.sock` (control) and `/tmp/gpio_get.sock` (status)
+- Provides high-level methods: `open_box_outer_door()`, `is_inner_door_closed()`, `has_item()`
+- Maintains `current_states` dict updated via socket events
+
+### LCDController (`application/hardware/lcd_controller.py`)
+- Sends display commands to `/tmp/ht1621.sock`
+- Manages backlight via GPIO controller
+
+### KeyboardHandler (`application/input/keyboard_handler.py`)
+- Receives events from `/tmp/keyboard_get.sock`
+- Buffers digit input, triggers callbacks on Enter/Delete
+
 ## Important Notes
 
 - **USB Device Mapping**: USB2GPIO devices are identified by insertion order. The geter (input) device should be inserted last to ensure correct mapping.
@@ -175,3 +209,5 @@ Key sections:
 - **State Caching**: GPIO daemon caches states to avoid redundant writes
 - **Segment Mapping**: HT1621 uses custom segment order (dp-c-b-a-d-e-g-f)
 - **Init Trigger**: System requires holding GPIO16 for 10 seconds to initialize
+- **Numpad Support**: Keyboard handler supports numpad digits, Enter, and Delete keys
+- **Door Stability**: Wait 3 seconds after door close before checking state

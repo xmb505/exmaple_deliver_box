@@ -1,1 +1,1 @@
-# State Machine package
+# state_machine module
