@@ -494,6 +494,9 @@ class GPIOControlDaemon:
                     controller.set_gpio(gpio_states)
             
             elif mode == 'spi' and controller_config['mode'] == 'spi':
+                if alias not in self.controllers:
+                    print(f"错误: 设备 {alias} 暂不可用（未初始化）")
+                    return
                 # 将SPI命令加入队列，由专门的线程处理
                 spi_task = {
                     'controller': controller,
@@ -1007,31 +1010,33 @@ class GPIOControlDaemon:
                     pass
     
     def get_current_gpio_status(self):
-        """获取当前所有GPIO的状态"""
+        """获取当前所有GPIO的状态（包括 /dev/null 不可用设备）"""
         current_status = {
             "type": "current_status",
             "timestamp": time.time(),
             "gpios": []
         }
-        
-        # 为每个geter类型的控制器获取当前状态
-        for alias, controller in self.controllers.items():
-            if self.controller_configs[alias]['mode'] == 'geter':
+
+        # 遍历所有控制器配置，包括 /dev/null 的设备
+        for alias, config in self.controller_configs.items():
+            if config['mode'] == 'geter':
                 default_bit = self.gpio_default_states.get(alias, 0)
-                
-                # 从current_gpio_states获取当前GPIO状态，如果为空则使用最后一次已知状态
-                current_gpio_states = self.current_gpio_states.get(alias, {}).copy()
-                
-                # 如果current_gpio_states为空，使用gpio_last_states作为备选
-                if not current_gpio_states and alias in self.gpio_last_states:
-                    current_gpio_states = self.gpio_last_states[alias].copy()
-                
+                available = alias in self.controllers
+
+                # 从 current_gpio_states 获取实际状态（如果有）
+                current_gpio_states = {}
+                if available:
+                    current_gpio_states = self.current_gpio_states.get(alias, {}).copy()
+                    if not current_gpio_states and alias in self.gpio_last_states:
+                        current_gpio_states = self.gpio_last_states[alias].copy()
+
                 current_status["gpios"].append({
                     "alias": alias,
                     "default_bit": default_bit,
+                    "available": available,
                     "current_gpio_states": current_gpio_states
                 })
-        
+
         return current_status
     
     def start_status_server(self):
@@ -1201,6 +1206,9 @@ class WebSocketServer:
 
     def handle_client(self, client_socket, addr):
         """处理 WebSocket 客户端连接"""
+        import hashlib
+        import base64
+
         try:
             # 握手
             request = client_socket.recv(4096).decode('utf-8')
@@ -1208,12 +1216,28 @@ class WebSocketServer:
                 client_socket.close()
                 return
 
-            # 简单握手响应
+            # 提取 Sec-WebSocket-Key 并计算 Accept
+            key = None
+            for line in request.split('\r\n'):
+                if line.startswith('Sec-WebSocket-Key:'):
+                    key = line.split(':', 1)[1].strip()
+                    break
+
+            if not key:
+                client_socket.close()
+                return
+
+            # 计算 Sec-WebSocket-Accept
+            GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+            accept_key = base64.b64encode(
+                hashlib.sha1((key + GUID).encode()).digest()
+            ).decode()
+
             response = (
                 "HTTP/1.1 101 Switching Protocols\r\n"
                 "Upgrade: websocket\r\n"
                 "Connection: Upgrade\r\n"
-                "Sec-WebSocket-Accept: HSMrcB7WhLX6xOk4n/1y4g==\r\n"
+                f"Sec-WebSocket-Accept: {accept_key}\r\n"
                 "\r\n"
             )
             client_socket.send(response.encode())
@@ -1257,7 +1281,11 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
         print(f"[HTTP] {self.address_string()} - {format % args}")
 
     def do_POST(self):
-        """处理 POST 请求，直接透传 JSON 到 Unix Socket"""
+        """处理 POST 请求"""
+        if self.path != '/gpio':
+            self.send_error(404, "Not Found")
+            return
+
         try:
             # 读取请求体
             content_length = int(self.headers.get('Content-Length', 0))
@@ -1284,17 +1312,12 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """处理 GET 请求，查询状态"""
+        if self.path not in ('/status', '/status/'):
+            self.send_error(404, "Not Found")
+            return
+
         try:
-            if self.path == '/status':
-                response = self.process_command({'type': 'query_status'})
-            elif self.path.startswith('/status/'):
-                # 支持查询特定 GPIO 状态
-                response = self.process_command({'type': 'query_status'})
-            else:
-                response = {'error': 'Unknown endpoint', 'help': {
-                    'POST /gpio': 'Send GPIO command (same JSON as Unix Socket)',
-                    'GET /status': 'Query current GPIO status'
-                }}
+            response = self.process_command({'type': 'query_status'})
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -1334,54 +1357,29 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
             return {'error': 'Missing gpio/value or gpios/values'}
 
         elif mode == 'spi' and controller_config['mode'] == 'spi':
-            # SPI 命令同步执行（与 Unix Socket 的队列方式不同，这里同步执行）
-            try:
-                from urllib.parse import parse_qs
-                spi_num = command.get('spi_num', 1)
-                spi_data = command.get('spi_data', '')
-                cs_collection = command.get('spi_data_cs_collection', 'down')
+            # SPI 命令加入队列，由专门的线程处理（与 Unix Socket 一致）
+            if alias not in self.daemon.controllers:
+                return {'error': f'Device {alias} not available'}
 
-                clk_pin = controller_config['spi_pins'].get('clk')
-                data_pin = controller_config['spi_pins'].get('data')
-                cs_pin = controller_config['spi_pins'].get(f'cs_{spi_num}')
-
-                if not all([clk_pin, data_pin, cs_pin]):
-                    return {'error': 'Missing SPI pin configuration'}
-
-                try:
-                    lag_time_ms = float(controller_config.get('config', {}).get('lag_time', 1.0))
-                    if lag_time_ms <= 0:
-                        lag_time_ms = 1.0
-                except (ValueError, TypeError):
-                    lag_time_ms = 1.0
-                lag_time = lag_time_ms / 1000.0
-
-                controller.set_spi(clk_pin, data_pin, cs_pin, spi_data, cs_collection, lag_time, False)
-                return {'success': True, 'alias': alias, 'spi_num': spi_num}
-            except Exception as e:
-                return {'error': str(e)}
+            spi_task = {
+                'controller': controller,
+                'config': controller_config,
+                'command': command
+            }
+            self.daemon.spi_queue.put(spi_task)
+            return {'success': True, 'message': 'SPI command queued', 'alias': alias, 'mode': 'spi'}
 
         elif mode == 'spi_multi' and controller_config['mode'] == 'spi':
-            try:
-                spis = command.get('spis', [])
-                for spi_config in spis:
-                    spi_num = spi_config.get('spi_num', 1)
-                    spi_data = spi_config.get('spi_data', '')
-                    cs_collection = spi_config.get('spi_data_cs_collection', 'down')
+            if alias not in self.daemon.controllers:
+                return {'error': f'Device {alias} not available'}
 
-                    cs_pin = controller_config['spi_pins'].get(f'cs_{spi_num}')
-                    if cs_pin:
-                        try:
-                            lag_time_ms = float(controller_config.get('config', {}).get('lag_time', 1.0))
-                        except:
-                            lag_time_ms = 1.0
-                        lag_time = lag_time_ms / 1000.0
-                        controller.set_spi(controller_config['spi_pins']['clk'],
-                                         controller_config['spi_pins']['data'],
-                                         cs_pin, spi_data, cs_collection, lag_time, False)
-                return {'success': True, 'alias': alias, 'spi_count': len(spis)}
-            except Exception as e:
-                return {'error': str(e)}
+            spi_task = {
+                'controller': controller,
+                'config': controller_config,
+                'command': command
+            }
+            self.daemon.spi_queue.put(spi_task)
+            return {'success': True, 'message': 'SPI multi command queued', 'alias': alias, 'mode': 'spi_multi'}
 
         elif command.get('type') == 'query_status':
             return self.daemon.get_current_gpio_status()
