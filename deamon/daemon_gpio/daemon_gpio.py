@@ -16,6 +16,15 @@ import os
 import select
 from pathlib import Path
 import queue
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs
+
+# 检查 websocket 库是否可用（仅用于 HTTP 端点检查）
+try:
+    __import__('websocket')
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
 
 
 class USBGPIOController:
@@ -338,34 +347,41 @@ class GPIOControlDaemon:
         for section_name in self.config.sections():
             if section_name == 'daemon_config':
                 continue
-            
+
             tty_path = self.config.get(section_name, 'tty_path')
             baudrate = self.config.getint(section_name, 'baudrate', fallback=115200)
             alias = self.config.get(section_name, 'alias')
             mode = self.config.get(section_name, 'mode')
-            
+
+            # 先保存配置信息（即使设备不可用也需要保留配置）
+            controller_config = {
+                'mode': mode,
+                'config': dict(self.config.items(section_name))
+            }
+
+            # 如果是 SPI 模式，提取 SPI 引脚配置
+            if mode == 'spi':
+                spi_pins = {}
+                for key, value in controller_config['config'].items():
+                    if key in ('clk', 'data') or key.startswith('cs_'):
+                        clean_value = value.split('#')[0].strip()
+                        if clean_value:
+                            try:
+                                spi_pins[key] = int(clean_value)
+                            except ValueError:
+                                print(f"警告: 无法将 '{key}' 的值 '{value}' 转换为整数")
+                controller_config['spi_pins'] = spi_pins
+
+            # /dev/null 表示该设备暂不可用，跳过但保留配置
+            if tty_path == '/dev/null':
+                print(f"设备 {alias} 配置为 /dev/null，跳过初始化")
+                self.controller_configs[alias] = controller_config
+                continue
+
             try:
                 controller = USBGPIOController(tty_path, baudrate, simulate=simulate)
                 self.controllers[alias] = controller
-                self.controller_configs[alias] = {
-                    'mode': mode,
-                    'config': dict(self.config.items(section_name))
-                }
-                
-                # 如果是SPI模式，提取SPI引脚配置
-                if mode == 'spi':
-                    spi_pins = {}
-                    for key, value in self.controller_configs[alias]['config'].items():
-                        # 读取共享的clk和data，以及所有cs引脚（cs_1到cs_14）
-                        if key in ('clk', 'data') or key.startswith('cs_'):
-                            # 去除可能的注释部分（以#开头的内容）
-                            clean_value = value.split('#')[0].strip()
-                            if clean_value:  # 确保去除注释后还有有效内容
-                                try:
-                                    spi_pins[key] = int(clean_value)
-                                except ValueError:
-                                    print(f"警告: 无法将 '{key}' 的值 '{value}' 转换为整数，跳过该配置")
-                    self.controller_configs[alias]['spi_pins'] = spi_pins
+                self.controller_configs[alias] = controller_config
             except Exception as e:
                 if not simulate:
                     print(f"初始化控制器 {alias} 失败: {e}")
@@ -373,29 +389,14 @@ class GPIOControlDaemon:
                     try:
                         controller = USBGPIOController(tty_path, baudrate, simulate=True)
                         self.controllers[alias] = controller
-                        self.controller_configs[alias] = {
-                            'mode': mode,
-                            'config': dict(self.config.items(section_name))
-                        }
-                        
-                        # 如果是SPI模式，提取SPI引脚配置
-                        if mode == 'spi':
-                            spi_pins = {}
-                            for key, value in self.controller_configs[alias]['config'].items():
-                                # 读取共享的clk和data，以及所有cs引脚（cs_1到cs_14）
-                                if key in ('clk', 'data') or key.startswith('cs_'):
-                                    # 去除可能的注释部分（以#开头的内容）
-                                    clean_value = value.split('#')[0].strip()
-                                    if clean_value:  # 确保去除注释后还有有效内容
-                                        try:
-                                            spi_pins[key] = int(clean_value)
-                                        except ValueError:
-                                            print(f"警告: 无法将 '{key}' 的值 '{value}' 转换为整数，跳过该配置")
-                            self.controller_configs[alias]['spi_pins'] = spi_pins
+                        self.controller_configs[alias] = controller_config
                     except Exception as e2:
                         print(f"即使在模拟模式下初始化控制器 {alias} 也失败: {e2}")
+                        # 使用模拟模式失败时，也保留配置以便后续处理
+                        self.controller_configs[alias] = controller_config
                 else:
-                    print(f"在模拟模式下初始化控制器 {alias} 失败: {e}")
+                    print(f"初始化控制器 {alias} 失败: {e}")
+                    self.controller_configs[alias] = controller_config
         
         # 创建控制Socket
         socket_path = self.config.get('daemon_config', 'socket_path', fallback='/tmp/gpio.sock')
@@ -424,7 +425,19 @@ class GPIOControlDaemon:
         self.spi_queue = queue.Queue()
         self.spi_processing_lock = threading.Lock()  # 确保SPI处理的互斥性
         self.spi_worker_thread = None
-        
+
+        # HTTP服务器
+        self.http_port = self.config.getint('daemon_config', 'http_port', fallback=0)
+        self.http_server = None
+        self.http_thread = None
+
+        # WebSocket服务器
+        self.ws_port = self.config.getint('daemon_config', 'ws_port', fallback=0)
+        self.ws_server = None
+        self.ws_thread = None
+        self.ws_clients = []
+        self.ws_clients_lock = threading.Lock()
+
         # 运行标志
         self.running = True
         
@@ -436,18 +449,24 @@ class GPIOControlDaemon:
             command = json.loads(data.decode('utf-8'))
             alias = command.get('alias')
             mode = command.get('mode')
-            
+
             # 调试：打印传入的命令
             if hasattr(self, 'debug') and self.debug:
                 print(f"调试: 收到命令 - {command}")
-            
-            if alias not in self.controllers:
+
+            if alias not in self.controller_configs:
                 print(f"错误: 未找到别名为 {alias} 的控制器")
                 return
-            
-            controller = self.controllers[alias]
+
             controller_config = self.controller_configs[alias]
-            
+
+            # 检查设备是否可用（/dev/null 表示暂不可用）
+            if alias not in self.controllers:
+                print(f"错误: 设备 {alias} 暂不可用（未初始化）")
+                return
+
+            controller = self.controllers[alias]
+
             if mode == 'set':
                 if 'gpio' in command and 'value' in command:
                     # 单个GPIO控制
@@ -584,7 +603,22 @@ class GPIOControlDaemon:
         self.spi_worker_thread = threading.Thread(target=self.process_spi_queue, daemon=True)
         self.spi_worker_thread.start()
         print("SPI工作线程已启动")
-    
+
+    def start_http_server(self):
+        """启动HTTP服务器"""
+        HTTPRequestHandler.daemon = self
+        self.http_server = HTTPServer(('0.0.0.0', self.http_port), HTTPRequestHandler)
+        self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
+        self.http_thread.start()
+        print(f"HTTP服务器已启动，监听端口 {self.http_port}")
+
+    def start_ws_server(self):
+        """启动WebSocket服务器用于GPIO状态广播"""
+        self.ws_server = WebSocketServer(self.ws_port, self.ws_clients, self.ws_clients_lock)
+        self.ws_thread = threading.Thread(target=self.ws_server.run, daemon=True)
+        self.ws_thread.start()
+        print(f"WebSocket服务器已启动，监听端口 {self.ws_port}")
+
     def handle_status_client(self, client_socket, client_addr):
         """处理状态监听客户端"""
         print(f"新的状态监听客户端连接: {client_addr}")
@@ -871,10 +905,55 @@ class GPIOControlDaemon:
                 alias = gpio_info.get('alias')
                 if alias not in self.gpio_change_buffer:
                     self.gpio_change_buffer[alias] = []
-                
+
                 # 添加到缓冲区
                 self.gpio_change_buffer[alias].append(gpio_info)
+
+        # 通过WebSocket广播给HTTP客户端（实时推送）
+        self.ws_broadcast(status_data)
     
+    def ws_broadcast(self, status_data):
+        """通过 WebSocket 广播 GPIO 状态变化"""
+        if not hasattr(self, 'ws_clients') or not self.ws_clients:
+            return
+
+        message_id = self.get_next_message_id()
+        message = {
+            "type": "gpio_change",
+            "id": message_id,
+            "timestamp": time.time(),
+            **status_data
+        }
+        json_data = json.dumps(message)
+
+        # 转换为 WebSocket 帧格式
+        frame = self.encode_ws_frame(json_data)
+
+        with self.ws_clients_lock:
+            disconnected = []
+            for client in self.ws_clients:
+                try:
+                    client.send(frame)
+                except:
+                    disconnected.append(client)
+
+            for client in disconnected:
+                self.ws_clients.remove(client)
+
+    def encode_ws_frame(self, data):
+        """编码 WebSocket 帧"""
+        payload = data.encode('utf-8')
+        payload_len = len(payload)
+
+        if payload_len <= 125:
+            header = bytes([0x81, payload_len])
+        elif payload_len <= 65535:
+            header = bytes([0x81, 126, (payload_len >> 8) & 0xFF, payload_len & 0xFF])
+        else:
+            header = bytes([0x81, 127]) + payload_len.to_bytes(8, 'big')
+
+        return header + payload
+
     def send_buffered_gpio_status(self):
         """发送缓冲区中的GPIO状态变化"""
         with self.gpio_change_buffer_lock:
@@ -984,7 +1063,15 @@ class GPIOControlDaemon:
         # 启动GPIO监控线程
         gpio_monitor_thread = threading.Thread(target=self.start_gpio_monitoring, daemon=True)
         gpio_monitor_thread.start()
-        
+
+        # 启动HTTP服务器（如果配置了端口）
+        if self.http_port > 0:
+            self.start_http_server()
+
+        # 启动WebSocket服务器（如果配置了端口）
+        if self.ws_port > 0 and WEBSOCKET_AVAILABLE:
+            self.start_ws_server()
+
         # 主循环 - 处理控制命令
         while self.running:
             try:
@@ -1051,7 +1138,14 @@ class GPIOControlDaemon:
                     controller.ser.close()
             except:
                 pass
-        
+
+        # 关闭HTTP服务器
+        if self.http_server:
+            try:
+                self.http_server.shutdown()
+            except:
+                pass
+
         # 清理socket文件
         socket_path = self.config.get('daemon_config', 'socket_path', fallback='/tmp/gpio.sock')
         get_status_path = self.config.get('daemon_config', 'get_statu_path', fallback='/tmp/gpio_get.sock')
@@ -1071,6 +1165,228 @@ class GPIOControlDaemon:
             pass
         
         print("GPIO守护进程已停止")
+
+
+class WebSocketServer:
+    """简单的 WebSocket 服务器，用于 GPIO 状态广播"""
+
+    def __init__(self, port, clients_list, clients_lock):
+        self.port = port
+        self.clients = clients_list
+        self.clients_lock = clients_lock
+        self.running = True
+        self.server_socket = None
+
+    def run(self):
+        """运行 WebSocket 服务器"""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind(('0.0.0.0', self.port))
+            self.server_socket.listen(10)
+
+            while self.running:
+                try:
+                    self.server_socket.settimeout(1.0)
+                    client_socket, addr = self.server_socket.accept()
+                    threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, addr),
+                        daemon=True
+                    ).start()
+                except socket.timeout:
+                    continue
+        except Exception as e:
+            print(f"WebSocket服务器错误: {e}")
+
+    def handle_client(self, client_socket, addr):
+        """处理 WebSocket 客户端连接"""
+        try:
+            # 握手
+            request = client_socket.recv(4096).decode('utf-8')
+            if 'Upgrade: websocket' not in request:
+                client_socket.close()
+                return
+
+            # 简单握手响应
+            response = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Accept: HSMrcB7WhLX6xOk4n/1y4g==\r\n"
+                "\r\n"
+            )
+            client_socket.send(response.encode())
+
+            with self.clients_lock:
+                self.clients.append(client_socket)
+            print(f"WebSocket客户端连接: {addr}")
+
+            # 保持连接并处理消息
+            while self.running:
+                try:
+                    client_socket.settimeout(0.5)
+                    data = client_socket.recv(4096)
+                    if not data:
+                        break
+                except socket.timeout:
+                    continue
+                except:
+                    break
+
+        except Exception as e:
+            print(f"WebSocket客户端错误: {e}")
+        finally:
+            with self.clients_lock:
+                if client_socket in self.clients:
+                    self.clients.remove(client_socket)
+            try:
+                client_socket.close()
+            except:
+                pass
+            print(f"WebSocket客户端断开: {addr}")
+
+
+class HTTPRequestHandler(BaseHTTPRequestHandler):
+    """HTTP 请求处理器，接口与 Unix Socket JSON 格式一致"""
+
+    daemon = None  # 将在初始化时设置
+
+    def log_message(self, format, *args):
+        """自定义日志格式"""
+        print(f"[HTTP] {self.address_string()} - {format % args}")
+
+    def do_POST(self):
+        """处理 POST 请求，直接透传 JSON 到 Unix Socket"""
+        try:
+            # 读取请求体
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+
+            # 解析 JSON
+            try:
+                command = json.loads(body)
+            except json.JSONDecodeError:
+                self.send_error(400, "Invalid JSON")
+                return
+
+            # 获取响应数据
+            response = self.process_command(command)
+
+            # 发送响应
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def do_GET(self):
+        """处理 GET 请求，查询状态"""
+        try:
+            if self.path == '/status':
+                response = self.process_command({'type': 'query_status'})
+            elif self.path.startswith('/status/'):
+                # 支持查询特定 GPIO 状态
+                response = self.process_command({'type': 'query_status'})
+            else:
+                response = {'error': 'Unknown endpoint', 'help': {
+                    'POST /gpio': 'Send GPIO command (same JSON as Unix Socket)',
+                    'GET /status': 'Query current GPIO status'
+                }}
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def process_command(self, command):
+        """处理命令并返回结果，与 Unix Socket 处理逻辑一致"""
+        if self.daemon is None:
+            return {'error': 'Daemon not initialized'}
+
+        alias = command.get('alias')
+        mode = command.get('mode')
+
+        # 检查 alias 是否存在于配置中
+        if not alias or alias not in self.daemon.controller_configs:
+            return {'error': f'Unknown alias: {alias}', 'available': list(self.daemon.controller_configs.keys())}
+
+        # 检查设备是否可用
+        if alias not in self.daemon.controllers:
+            return {'error': f'Device {alias} not available (check /dev/null config)'}
+
+        controller = self.daemon.controllers[alias]
+        controller_config = self.daemon.controller_configs[alias]
+
+        if mode == 'set':
+            if 'gpio' in command and 'value' in command:
+                controller.set_gpio({command['gpio']: command['value']})
+                return {'success': True, 'alias': alias, 'gpio': command['gpio'], 'value': command['value']}
+            elif 'gpios' in command and 'values' in command:
+                gpio_states = dict(zip(command['gpios'], command['values']))
+                controller.set_gpio(gpio_states)
+                return {'success': True, 'alias': alias, 'gpios': command['gpios'], 'values': command['values']}
+            return {'error': 'Missing gpio/value or gpios/values'}
+
+        elif mode == 'spi' and controller_config['mode'] == 'spi':
+            # SPI 命令同步执行（与 Unix Socket 的队列方式不同，这里同步执行）
+            try:
+                from urllib.parse import parse_qs
+                spi_num = command.get('spi_num', 1)
+                spi_data = command.get('spi_data', '')
+                cs_collection = command.get('spi_data_cs_collection', 'down')
+
+                clk_pin = controller_config['spi_pins'].get('clk')
+                data_pin = controller_config['spi_pins'].get('data')
+                cs_pin = controller_config['spi_pins'].get(f'cs_{spi_num}')
+
+                if not all([clk_pin, data_pin, cs_pin]):
+                    return {'error': 'Missing SPI pin configuration'}
+
+                try:
+                    lag_time_ms = float(controller_config.get('config', {}).get('lag_time', 1.0))
+                    if lag_time_ms <= 0:
+                        lag_time_ms = 1.0
+                except (ValueError, TypeError):
+                    lag_time_ms = 1.0
+                lag_time = lag_time_ms / 1000.0
+
+                controller.set_spi(clk_pin, data_pin, cs_pin, spi_data, cs_collection, lag_time, False)
+                return {'success': True, 'alias': alias, 'spi_num': spi_num}
+            except Exception as e:
+                return {'error': str(e)}
+
+        elif mode == 'spi_multi' and controller_config['mode'] == 'spi':
+            try:
+                spis = command.get('spis', [])
+                for spi_config in spis:
+                    spi_num = spi_config.get('spi_num', 1)
+                    spi_data = spi_config.get('spi_data', '')
+                    cs_collection = spi_config.get('spi_data_cs_collection', 'down')
+
+                    cs_pin = controller_config['spi_pins'].get(f'cs_{spi_num}')
+                    if cs_pin:
+                        try:
+                            lag_time_ms = float(controller_config.get('config', {}).get('lag_time', 1.0))
+                        except:
+                            lag_time_ms = 1.0
+                        lag_time = lag_time_ms / 1000.0
+                        controller.set_spi(controller_config['spi_pins']['clk'],
+                                         controller_config['spi_pins']['data'],
+                                         cs_pin, spi_data, cs_collection, lag_time, False)
+                return {'success': True, 'alias': alias, 'spi_count': len(spis)}
+            except Exception as e:
+                return {'error': str(e)}
+
+        elif command.get('type') == 'query_status':
+            return self.daemon.get_current_gpio_status()
+
+        return {'error': f'Unknown mode: {mode}'}
 
 
 if __name__ == '__main__':
