@@ -641,10 +641,10 @@ class GPIOControlDaemon:
     def start_http_server(self):
         """启动HTTP服务器"""
         from .server_http import HTTPRequestHandler
-        from http.server import HTTPServer
+        from http.server import ThreadingHTTPServer
 
         HTTPRequestHandler.daemon = self
-        self.http_server = HTTPServer(('0.0.0.0', self.http_port), HTTPRequestHandler)
+        self.http_server = ThreadingHTTPServer(('0.0.0.0', self.http_port), HTTPRequestHandler)
         self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
         self.http_thread.start()
         print(f"HTTP服务器已启动，监听端口 {self.http_port}")

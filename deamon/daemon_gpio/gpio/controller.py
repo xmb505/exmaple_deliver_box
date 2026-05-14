@@ -6,6 +6,7 @@ USB GPIO 控制器模块
 
 import serial
 import time
+import threading
 
 
 class USBGPIOController:
@@ -20,6 +21,7 @@ class USBGPIOController:
         self.gpio_states = {}  # 用于模拟模式下的GPIO状态
         self.current_gpio_states = {}  # 当前各GPIO引脚的状态
         self.data_buffer = ""  # 数据缓冲区，用于累积流式数据避免截断
+        self._lock = threading.Lock()  # 串口操作锁，防止并发竞争
 
         if not simulate:
             self.connect()
@@ -92,24 +94,26 @@ class USBGPIOController:
         """
         设置GPIO状态，gpio_states为字典 {pin: state, ...}
         优化：只对状态发生变化的GPIO引脚发送命令
+        线程安全：使用锁保护串口操作，防止并发竞争
         """
-        changed_states = {}
-        for pin, new_state in gpio_states.items():
-            gpio_pin = int(pin)
-            state = int(new_state)
-            current_state = self.current_gpio_states.get(gpio_pin)
-            if current_state is None or current_state != state:
-                changed_states[gpio_pin] = state
-                self.current_gpio_states[gpio_pin] = state
+        with self._lock:
+            changed_states = {}
+            for pin, new_state in gpio_states.items():
+                gpio_pin = int(pin)
+                state = int(new_state)
+                current_state = self.current_gpio_states.get(gpio_pin)
+                if current_state is None or current_state != state:
+                    changed_states[gpio_pin] = state
+                    self.current_gpio_states[gpio_pin] = state
 
-        if not changed_states:
-            return True
+            if not changed_states:
+                return True
 
-        command = bytearray([0x3A])
-        for gpio_pin, state in changed_states.items():
-            command.append(gpio_pin)
-            command.append(state)
-        return self.send_command(bytes(command))
+            command = bytearray([0x3A])
+            for gpio_pin, state in changed_states.items():
+                command.append(gpio_pin)
+                command.append(state)
+            return self.send_command(bytes(command))
 
     def read_gpio(self, gpio_pin):
         """读取单个GPIO状态"""
